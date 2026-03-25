@@ -214,6 +214,9 @@ if (typeof Engine === 'function') {{
     executable: 'index',
     focusCanvas: true,
     ensureCrossOriginIsolationHeaders: false,
+    experimentalVK: false,
+    emscriptenPoolSize: 0,
+    godotPoolSize: 0,
   }});
   engine.startGame({{
     onProgress: (c, t) => {{
