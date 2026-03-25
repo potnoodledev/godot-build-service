@@ -14,6 +14,7 @@ import { Agent } from "@mariozechner/pi-agent-core";
 import { streamSimple } from "@mariozechner/pi-ai";
 import { createBashTool } from "@mariozechner/pi-coding-agent";
 import { DockerBashOperations } from "./docker-bash-ops.js";
+import { LocalBashOperations } from "./local-bash-ops.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -26,6 +27,16 @@ const NIM_API_KEY = process.env.LLM_API_KEY || process.env.NVIDIA_NIM_API_KEY ||
 const DOCKER_IMAGE = process.env.DOCKER_IMAGE || "godot-build";
 const MAX_STEPS = 30;
 const CONTAINER_CWD = "/root";
+
+// Detect if Docker is available
+let HAS_DOCKER = false;
+try { execSync("docker info", { stdio: "pipe" }); HAS_DOCKER = true; } catch {}
+
+// Detect if Godot is available locally (Railway container)
+let HAS_LOCAL_GODOT = false;
+try { execSync("godot --version", { stdio: "pipe" }); HAS_LOCAL_GODOT = true; } catch {}
+
+const TEMPLATE_DIR = join(__dirname, "template");
 
 const app = express();
 app.use(express.json({ limit: "50mb" }));
@@ -42,7 +53,7 @@ function checkAuth(req, res, next) {
 // ── Health ──────────────────────────────────────────────────────────
 
 app.get("/health", (req, res) => {
-  res.json({ status: "ok", nim_key: !!NIM_API_KEY, docker_image: DOCKER_IMAGE });
+  res.json({ status: "ok", nim_key: !!NIM_API_KEY, docker: HAS_DOCKER, local_godot: HAS_LOCAL_GODOT, mode: HAS_DOCKER ? "docker" : "local" });
 });
 
 // ── NIM Model ──────────────────────────────────────────────────────
@@ -80,32 +91,38 @@ app.post("/generate-game", checkAuth, async (req, res) => {
   const send = (data) => { try { res.write(`data: ${JSON.stringify(data)}\n\n`); } catch {} };
   const sessionId = randomUUID().slice(0, 8);
   const modelId = process.env.LLM_MODEL || "moonshotai/kimi-k2.5";
-  const dockerOps = new DockerBashOperations();
+  const useDocker = HAS_DOCKER && !process.env.FORCE_LOCAL;
+  const ops = useDocker ? new DockerBashOperations() : new LocalBashOperations(TEMPLATE_DIR);
 
-  console.log(`[generate] Session ${sessionId}: "${concept}" (model: ${modelId})`);
+  console.log(`[generate] Session ${sessionId}: "${concept}" (model: ${modelId}, ${useDocker ? "docker" : "local"})`);
   send({ type: "session", session_id: sessionId, model: modelId });
 
+  let workspacePath;
   try {
-    // 1. Spin up Docker container with Godot
-    send({ type: "status", message: "Starting build container..." });
-    const containerId = dockerOps.createContainer(DOCKER_IMAGE);
-    dockerOps.startContainer();
-    send({ type: "status", message: `Container ${containerId.slice(0, 12)} started` });
-
-    // Setup workspace inside container
-    await dockerOps.exec(
-      "mkdir -p /workspace/template /workspace/output && cp -r /app/template/* /workspace/template/ && echo 'Workspace ready'",
-      "/root",
-      { onData: (d) => console.log(`  [setup] ${d.toString().trim()}`), timeout: 30 },
-    );
+    // 1. Setup workspace
+    if (useDocker) {
+      send({ type: "status", message: "Starting Docker container..." });
+      const containerId = ops.createContainer(DOCKER_IMAGE);
+      ops.startContainer();
+      workspacePath = "/workspace";
+      await ops.exec(
+        "mkdir -p /workspace/template /workspace/output && cp -r /app/template/* /workspace/template/ && echo 'Ready'",
+        "/root",
+        { onData: (d) => console.log(`  [setup] ${d.toString().trim()}`), timeout: 30 },
+      );
+    } else {
+      send({ type: "status", message: "Setting up workspace..." });
+      workspacePath = ops.createWorkspace();
+    }
     send({ type: "status", message: "Workspace ready" });
 
     // 2. Create model + tools
     const model = nimModel(modelId);
-    const bashTool = createBashTool(CONTAINER_CWD, { operations: dockerOps });
+    const bashCwd = useDocker ? "/root" : workspacePath;
+    const bashTool = createBashTool(bashCwd, { operations: ops });
 
-    // 3. Build system prompt (workspace is at /workspace, CWD is /root)
-    const systemPrompt = buildSystemPrompt("/workspace");
+    // 3. Build system prompt
+    const systemPrompt = buildSystemPrompt(workspacePath);
 
     // 4. Create agent
     let stepCount = 0;
@@ -175,11 +192,11 @@ If the build fails, fix the errors and rebuild.`;
     let code = "";
     let pckBase64 = "";
 
-    // Read main.gd from container
+    // Read main.gd from workspace
     try {
       const readResult = await new Promise((resolve) => {
         let output = "";
-        dockerOps.exec("cat /workspace/template/main.gd 2>/dev/null", CONTAINER_CWD, {
+        ops.exec(`cat ${workspacePath}/template/main.gd 2>/dev/null`, bashCwd, {
           onData: (d) => { output += d.toString(); },
           timeout: 5,
         }).then(() => resolve(output)).catch(() => resolve(""));
@@ -187,12 +204,12 @@ If the build fails, fix the errors and rebuild.`;
       code = readResult;
     } catch {}
 
-    // Read .pck from container
+    // Read .pck from workspace
     if (succeeded) {
       try {
         const pckResult = await new Promise((resolve) => {
           let output = "";
-          dockerOps.exec("base64 -w0 /workspace/output/index.pck 2>/dev/null", CONTAINER_CWD, {
+          ops.exec(`base64 -w0 ${workspacePath}/output/index.pck 2>/dev/null`, bashCwd, {
             onData: (d) => { output += d.toString(); },
             timeout: 10,
           }).then(() => resolve(output.trim())).catch(() => resolve(""));
@@ -205,7 +222,7 @@ If the build fails, fix the errors and rebuild.`;
     let ghpagesUrl = "";
     if (succeeded && pckBase64 && day && GITHUB_TOKEN) {
       send({ type: "status", message: "Deploying to GitHub Pages..." });
-      ghpagesUrl = await pushToGhPages(day, project_name || concept, pckBase64, dockerOps) || "";
+      ghpagesUrl = await pushToGhPages(day, project_name || concept, pckBase64, ops, workspacePath, bashCwd) || "";
     }
 
     send({
@@ -224,14 +241,14 @@ If the build fails, fix the errors and rebuild.`;
     console.error(`[generate] Error: ${err.message}`);
     send({ type: "error", error: err.message });
   } finally {
-    dockerOps.destroyContainer();
+    ops.destroyContainer();
     res.end();
   }
 });
 
 // ── GitHub Pages deploy ─────────────────────────────────────────────
 
-async function pushToGhPages(day, title, pckBase64, dockerOps) {
+async function pushToGhPages(day, title, pckBase64, ops, workspacePath, bashCwd) {
   const dayPadded = String(day).padStart(5, "0");
   const basePath = `builds/day-${dayPadded}`;
   const pckBytes = Buffer.from(pckBase64, "base64");
@@ -244,7 +261,7 @@ async function pushToGhPages(day, title, pckBase64, dockerOps) {
   for (const fname of ["index.js", "index.audio.worklet.js", "index.audio.position.worklet.js"]) {
     try {
       let content = "";
-      await dockerOps.exec(`base64 -w0 /workspace/output/${fname} 2>/dev/null`, CONTAINER_CWD, {
+      await ops.exec(`base64 -w0 ${workspacePath}/output/${fname} 2>/dev/null`, bashCwd, {
         onData: (d) => { content += d.toString(); },
         timeout: 10,
       });
@@ -257,7 +274,7 @@ async function pushToGhPages(day, title, pckBase64, dockerOps) {
   // Push gzipped wasm
   try {
     let wasmGz = "";
-    await dockerOps.exec("gzip -c /workspace/output/index.wasm | base64 -w0", CONTAINER_CWD, {
+    await ops.exec(`gzip -c ${workspacePath}/output/index.wasm | base64 -w0`, bashCwd, {
       onData: (d) => { wasmGz += d.toString(); },
       timeout: 30,
     });
@@ -335,6 +352,6 @@ app.post("/build", checkAuth, async (req, res) => {
 app.listen(PORT, () => {
   console.log(`Godot Build Service on port ${PORT}`);
   console.log(`  NIM key: ${NIM_API_KEY ? "set" : "NOT SET"}`);
-  console.log(`  Docker image: ${DOCKER_IMAGE}`);
+  console.log(`  Mode: ${HAS_DOCKER ? "docker (" + DOCKER_IMAGE + ")" : "local (godot: " + HAS_LOCAL_GODOT + ")"}`);
   console.log(`  GitHub repo: ${GITHUB_REPO}`);
 });
