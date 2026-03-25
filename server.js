@@ -75,7 +75,7 @@ function nimModel(modelId) {
     baseUrl: "https://integrate.api.nvidia.com/v1",
     reasoning: false, input: ["text"],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    contextWindow: 131072, maxTokens: 4096,
+    contextWindow: 131072, maxTokens: 16384,
     headers: { Authorization: `Bearer ${NIM_API_KEY}` },
   };
 }
@@ -125,16 +125,30 @@ async function runBuild(sessionId, concept, projectName, day, send) {
 
     agent.subscribe((event) => {
       switch (event.type) {
+        case "message_start":
+          if (event.message?.role === "assistant") {
+            send({ type: "thinking", message: "Thinking..." });
+          }
+          break;
+        case "message_update": {
+          const ae = event.assistantMessageEvent;
+          if (ae?.type === "text_delta" && ae.delta) {
+            send({ type: "text_delta", content: ae.delta });
+          } else if (ae?.type === "thinking_delta" && ae.delta) {
+            send({ type: "thinking_delta", content: ae.delta });
+          }
+          break;
+        }
         case "message_end":
           if (event.message?.role === "assistant") {
             const text = event.message.content?.map((c) => c.text || "").join("") || "";
-            if (text) { send({ type: "text", content: text.slice(0, 500) }); session.log.push(text.slice(0, 200)); }
+            if (text) session.log.push(text.slice(0, 200));
           }
           break;
         case "tool_execution_start": {
           stepCount++;
           const cmd = event.args?.command || "";
-          send({ type: "tool", step: stepCount, command: cmd.slice(0, 200) });
+          send({ type: "tool", step: stepCount, command: cmd.slice(0, 300) });
           session.log.push(`step ${stepCount}: ${cmd.slice(0, 100)}`);
           console.log(`  [${sessionId}] Step ${stepCount}: ${cmd.slice(0, 80)}`);
           if (stepCount >= MAX_STEPS) agent.abort();
@@ -142,10 +156,8 @@ async function runBuild(sessionId, concept, projectName, day, send) {
         }
         case "tool_execution_end": {
           const rt = typeof event.result === "string" ? event.result : event.result?.content?.map((c) => c.text || "").join("") || "";
-          if (rt.includes("BUILD_SUCCESS") || rt.includes("BUILD_FAIL") || rt.includes("SCRIPT ERROR") || rt.includes("Wrote main.gd")) {
-            send({ type: "build_output", output: rt.slice(0, 1000) });
-            session.log.push(rt.slice(0, 200));
-          }
+          send({ type: "tool_result", output: rt.slice(0, 2000) });
+          session.log.push(rt.slice(0, 200));
           if (rt.includes("BUILD_SUCCESS")) succeeded = true;
           break;
         }
@@ -291,9 +303,11 @@ function go(){
     try{
       const d=JSON.parse(e.data);
       if(d.type==='status')addLog('>> '+d.message);
-      else if(d.type==='tool')addLog('  step '+d.step+': '+d.command.slice(0,100));
-      else if(d.type==='build_output')addLog('  >> '+d.output.slice(0,150));
-      else if(d.type==='text'){}
+      else if(d.type==='thinking')addLog('\\n💭 '+d.message);
+      else if(d.type==='thinking_delta'){document.getElementById('log').textContent+=d.content;}
+      else if(d.type==='text_delta'){document.getElementById('log').textContent+=d.content;}
+      else if(d.type==='tool')addLog('\\n🔧 step '+d.step+': '+d.command.slice(0,120));
+      else if(d.type==='tool_result')addLog('  → '+d.output.slice(0,200));
       else if(d.type==='done'){
         addLog(d.success?'\\n✅ BUILD SUCCESS':'\\n❌ BUILD FAILED');
         if(d.success&&d.preview_url){
