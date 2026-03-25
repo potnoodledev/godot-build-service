@@ -4,7 +4,7 @@
  * Each session gets its own temp directory for isolation.
  */
 import { spawn } from "child_process";
-import { mkdirSync, cpSync, rmSync } from "fs";
+import { mkdirSync, cpSync, rmSync, chmodSync } from "fs";
 import { join } from "path";
 import { randomUUID } from "crypto";
 
@@ -24,6 +24,10 @@ export class LocalBashOperations {
     mkdirSync(join(this.workDir, "output"), { recursive: true });
     if (this.templateDir) {
       cpSync(this.templateDir, join(this.workDir, "template"), { recursive: true });
+    }
+    // Make template files read-only so agent can't overwrite them
+    for (const f of ["project.godot", "main.tscn", "api.gd", "export_presets.cfg"]) {
+      try { chmodSync(join(this.workDir, "template", f), 0o444); } catch {}
     }
     return this.workDir;
   }
