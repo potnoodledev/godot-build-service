@@ -61,6 +61,13 @@ class PiRpcProcess {
     const args = ["--mode", "rpc", "--cwd", cwd];
     if (systemPrompt) args.push("--system-prompt", systemPrompt);
 
+    // Pass LLM provider/key/model to pi agent
+    const provider = process.env.LLM_PROVIDER || "google";
+    const model = process.env.LLM_MODEL || "";
+    if (provider) args.push("--provider", provider);
+    if (model) args.push("--model", model);
+    if (LLM_API_KEY) args.push("--api-key", LLM_API_KEY);
+
     this.process = spawn(PI_BIN, args, {
       cwd,
       stdio: ["pipe", "pipe", "pipe"],
