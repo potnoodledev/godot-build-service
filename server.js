@@ -188,110 +188,108 @@ function createWorkspace(sessionId) {
   return workDir;
 }
 
-// ── Generate Game (autonomous agent) ────────────────────────────────
+// ── Generate Game (autonomous agent, SSE streaming) ─────────────────
 
-app.post("/generate-game", checkAuth, async (req, res) => {
+app.post("/generate-game", checkAuth, (req, res) => {
   const { concept, day, project_name } = req.body;
   if (!concept) return res.status(400).json({ error: "concept is required" });
+
+  // SSE headers to keep connection alive
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache",
+    Connection: "keep-alive",
+  });
+
+  const send = (data) => res.write(`data: ${JSON.stringify(data)}\n\n`);
 
   const sessionId = randomUUID().slice(0, 8);
   const workDir = createWorkspace(sessionId);
   const systemPrompt = buildSystemPrompt(workDir);
 
   console.log(`[generate] Session ${sessionId}: "${concept}" (day ${day || "?"})`);
+  send({ type: "session", session_id: sessionId });
 
   const rpc = new PiRpcProcess(sessionId);
-  const agentLog = [];
-  let finalCode = "";
-  let pckBase64 = "";
-  let ghpagesUrl = "";
 
-  try {
-    rpc.start(workDir, systemPrompt);
+  const timeout = setTimeout(() => {
+    send({ type: "error", error: "Agent timed out (5 minutes)" });
+    rpc.kill();
+    res.end();
+  }, 5 * 60 * 1000);
 
-    // Collect agent output
-    const result = await new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        reject(new Error("Agent timed out (5 minutes)"));
-      }, 5 * 60 * 1000);
+  rpc.addListener((msg) => {
+    // Stream progress to client
+    if (msg.type === "message_update") {
+      const evt = msg.assistantMessageEvent;
+      if (evt?.type === "text_delta") {
+        send({ type: "text", content: evt.delta });
+      } else if (evt?.type === "tool_use_start") {
+        send({ type: "tool", name: evt.name || "bash" });
+      }
+    }
+    if (msg.type === "tool_result") {
+      const output = typeof msg.output === "string" ? msg.output : JSON.stringify(msg.output || "");
+      send({ type: "tool_result", output: output.slice(0, 1000) });
+    }
 
-      rpc.addListener((msg) => {
-        // Log different event types
-        if (msg.type === "message_update") {
-          const evt = msg.assistantMessageEvent;
-          if (evt?.type === "text_delta") {
-            agentLog.push(evt.delta || "");
-          } else if (evt?.type === "tool_use_start") {
-            agentLog.push(`[tool] ${evt.name || evt.tool || "?"}`);
-          }
-        }
-        if (msg.type === "tool_result") {
-          const output = typeof msg.output === "string" ? msg.output : JSON.stringify(msg.output || "");
-          agentLog.push(`[result] ${output.slice(0, 500)}`);
-        }
-        if (msg.type === "agent_end") {
-          clearTimeout(timeout);
-          resolve(msg);
-        }
-        if (msg.type === "error") {
-          clearTimeout(timeout);
-          reject(new Error(msg.content || msg.error || "Agent error"));
-        }
+    // Agent finished
+    if (msg.type === "agent_end") {
+      clearTimeout(timeout);
+
+      // Read results
+      let code = "";
+      let pckBase64 = "";
+      const mainGdPath = join(workDir, "main.gd");
+      const templateMainGd = join(workDir, "template", "main.gd");
+      if (existsSync(mainGdPath)) code = readFileSync(mainGdPath, "utf-8");
+      else if (existsSync(templateMainGd)) code = readFileSync(templateMainGd, "utf-8");
+
+      const pckPath = join(workDir, "output", "index.pck");
+      if (existsSync(pckPath)) pckBase64 = readFileSync(pckPath).toString("base64");
+
+      send({
+        type: "done",
+        success: !!pckBase64,
+        day: day || 0,
+        code,
+        pck_base64: pckBase64,
+        pck_size: pckBase64 ? Buffer.from(pckBase64, "base64").length : 0,
+        session_id: sessionId,
       });
 
-      // Send the concept as the first prompt
-      const prompt = day
-        ? `Build a game for the concept: "${concept}". Day number: ${day}. Title: "${project_name || concept}". Write main.gd, build it, and deploy it.`
-        : `Build a game for the concept: "${concept}". Write main.gd and build it.`;
+      rpc.kill();
+      res.end();
 
-      rpc.send({ type: "prompt", message: prompt });
-    });
-
-    // Read the generated code
-    const mainGdPath = join(workDir, "main.gd");
-    const templateMainGd = join(workDir, "template", "main.gd");
-    if (existsSync(mainGdPath)) {
-      finalCode = readFileSync(mainGdPath, "utf-8");
-    } else if (existsSync(templateMainGd)) {
-      finalCode = readFileSync(templateMainGd, "utf-8");
+      // Clean up after delay
+      setTimeout(() => {
+        rmSync(workDir, { recursive: true, force: true });
+        console.log(`[cleanup] Removed workspace ${sessionId}`);
+      }, 60000);
     }
 
-    // Read .pck if build succeeded
-    const pckPath = join(workDir, "output", "index.pck");
-    if (existsSync(pckPath)) {
-      pckBase64 = readFileSync(pckPath).toString("base64");
+    if (msg.type === "error") {
+      clearTimeout(timeout);
+      send({ type: "error", error: msg.content || msg.error || "Agent error" });
+      rpc.kill();
+      res.end();
     }
+  });
 
-    // Check for gh-pages URL in agent log
-    const urlMatch = agentLog.join("\n").match(/https:\/\/potnoodledev\.github\.io[^\s"']*/);
-    if (urlMatch) ghpagesUrl = urlMatch[0];
-
-    res.json({
-      success: !!pckBase64,
-      day: day || 0,
-      code: finalCode,
-      pck_base64: pckBase64,
-      pck_size: pckBase64 ? Buffer.from(pckBase64, "base64").length : 0,
-      ghpages_url: ghpagesUrl,
-      agent_log: agentLog.slice(-50),
-      session_id: sessionId,
-    });
-  } catch (err) {
-    console.error(`[generate] Error: ${err.message}`);
-    res.status(500).json({
-      success: false,
-      error: err.message,
-      agent_log: agentLog.slice(-50),
-      session_id: sessionId,
-    });
-  } finally {
+  // Handle client disconnect
+  req.on("close", () => {
+    clearTimeout(timeout);
     rpc.kill();
-    // Clean up workspace after a delay (keep for debugging)
-    setTimeout(() => {
-      rmSync(workDir, { recursive: true, force: true });
-      console.log(`[cleanup] Removed workspace ${sessionId}`);
-    }, 60000);
-  }
+  });
+
+  rpc.start(workDir, systemPrompt);
+
+  // Send the concept as the first prompt
+  const prompt = day
+    ? `Build a game for the concept: "${concept}". Day number: ${day}. Title: "${project_name || concept}". Write main.gd, build it, and deploy it.`
+    : `Build a game for the concept: "${concept}". Write main.gd and build it.`;
+
+  rpc.send({ type: "prompt", message: prompt });
 });
 
 // ── Internal deploy endpoint (called by deploy skill script) ────────
