@@ -108,8 +108,10 @@ class PiRpcProcess {
   }
 
   start(cwd, systemPrompt) {
+    // Write system prompt as CLAUDE.md so pi reads it automatically
+    if (systemPrompt) writeFileSync(join(cwd, "CLAUDE.md"), systemPrompt);
+
     const args = ["--mode", "rpc", "--cwd", cwd];
-    if (systemPrompt) args.push("--system-prompt", systemPrompt);
 
     // Pass LLM provider/model to pi agent
     const provider = process.env.LLM_PROVIDER || "nvidia-nim";
@@ -117,6 +119,7 @@ class PiRpcProcess {
     args.push("--provider", provider);
     args.push("--model", model);
 
+    console.log(`[pi:${this.sessionId}] Spawning: ${PI_BIN} ${args.join(" ")}`);
     this.process = spawn(PI_BIN, args, {
       cwd,
       stdio: ["pipe", "pipe", "pipe"],
@@ -195,11 +198,11 @@ app.post("/generate-game", checkAuth, (req, res) => {
   if (!concept) return res.status(400).json({ error: "concept is required" });
 
   // SSE headers to keep connection alive
-  res.writeHead(200, {
-    "Content-Type": "text/event-stream",
-    "Cache-Control": "no-cache",
-    Connection: "keep-alive",
-  });
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no");
+  res.flushHeaders();
 
   const send = (data) => res.write(`data: ${JSON.stringify(data)}\n\n`);
 
@@ -235,6 +238,7 @@ app.post("/generate-game", checkAuth, (req, res) => {
 
     // Agent finished
     if (msg.type === "agent_end") {
+      finished = true;
       clearTimeout(timeout);
 
       // Read results
@@ -269,6 +273,7 @@ app.post("/generate-game", checkAuth, (req, res) => {
     }
 
     if (msg.type === "error") {
+      finished = true;
       clearTimeout(timeout);
       send({ type: "error", error: msg.content || msg.error || "Agent error" });
       rpc.kill();
@@ -276,20 +281,26 @@ app.post("/generate-game", checkAuth, (req, res) => {
     }
   });
 
-  // Handle client disconnect
-  req.on("close", () => {
-    clearTimeout(timeout);
-    rpc.kill();
-  });
+  let finished = false;
 
   rpc.start(workDir, systemPrompt);
 
-  // Send the concept as the first prompt
+  // Wait briefly for pi to initialize, then send prompt
   const prompt = day
     ? `Build a game for the concept: "${concept}". Day number: ${day}. Title: "${project_name || concept}". Write main.gd, build it, and deploy it.`
     : `Build a game for the concept: "${concept}". Write main.gd and build it.`;
 
-  rpc.send({ type: "prompt", message: prompt });
+  setTimeout(() => {
+    try {
+      console.log(`[generate] Sending prompt to ${sessionId}...`);
+      rpc.send({ type: "prompt", message: prompt });
+      console.log(`[generate] Prompt sent to ${sessionId}`);
+    } catch (err) {
+      console.error(`[generate] Send failed: ${err.message}`);
+      send({ type: "error", error: `Failed to send prompt: ${err.message}` });
+      res.end();
+    }
+  }, 2000);
 });
 
 // ── Internal deploy endpoint (called by deploy skill script) ────────
