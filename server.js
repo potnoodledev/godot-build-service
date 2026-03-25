@@ -43,7 +43,12 @@ const sessions = new Map();
 
 const app = express();
 app.use(express.json({ limit: "50mb" }));
-app.use("/preview", express.static(PREVIEWS_DIR));
+app.use("/preview", (req, res, next) => {
+  // Set COOP/COEP headers so Godot doesn't trigger the Chrome warning
+  res.setHeader("Cross-Origin-Opener-Policy", "same-origin");
+  res.setHeader("Cross-Origin-Embedder-Policy", "require-corp");
+  next();
+}, express.static(PREVIEWS_DIR));
 
 // ── Health ──────────────────────────────────────────────────────────
 
