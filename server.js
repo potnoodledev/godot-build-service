@@ -57,6 +57,10 @@ app.use("/preview", express.static(PREVIEWS_DIR));
 function checkAuth(req, res, next) {
   if (!API_KEY) return next();
   const key = req.body?.api_key || req.query?.api_key || "";
+  // Allow requests from the web UI (same origin, no api_key needed)
+  const referer = req.headers.referer || "";
+  const host = req.headers.host || "";
+  if (referer.includes(host) && !key) return next();
   if (key !== API_KEY) return res.status(403).json({ error: "Invalid api_key" });
   next();
 }
