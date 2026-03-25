@@ -4,6 +4,8 @@ import {
   existsSync,
   readFileSync,
   writeFileSync,
+  mkdirSync,
+  cpSync,
 } from "fs";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
@@ -38,8 +40,17 @@ try { execSync("godot --version", { stdio: "pipe" }); HAS_LOCAL_GODOT = true; } 
 
 const TEMPLATE_DIR = join(__dirname, "template");
 
+const PREVIEWS_DIR = join("/tmp", "previews");
+mkdirSync(PREVIEWS_DIR, { recursive: true });
+
+// Track active sessions
+const sessions = new Map(); // sessionId → { day, title, success, previewUrl }
+
 const app = express();
 app.use(express.json({ limit: "50mb" }));
+
+// Serve preview files
+app.use("/preview", express.static(PREVIEWS_DIR));
 
 // ── Auth ────────────────────────────────────────────────────────────
 
@@ -218,21 +229,61 @@ If the build fails, fix the errors and rebuild.`;
       } catch {}
     }
 
-    // 7. Push to gh-pages if requested and succeeded
-    let ghpagesUrl = "";
-    if (succeeded && pckBase64 && day && GITHUB_TOKEN) {
-      send({ type: "status", message: "Deploying to GitHub Pages..." });
-      ghpagesUrl = await pushToGhPages(day, project_name || concept, pckBase64, ops, workspacePath, bashCwd) || "";
+    // 7. Copy build output to preview directory
+    let previewUrl = "";
+    if (succeeded) {
+      send({ type: "status", message: "Setting up preview..." });
+      const previewDir = join(PREVIEWS_DIR, sessionId);
+      mkdirSync(previewDir, { recursive: true });
+
+      // Copy output files to preview dir
+      const filesToCopy = ["index.pck", "index.js", "index.wasm", "index.audio.worklet.js", "index.audio.position.worklet.js"];
+      for (const fname of filesToCopy) {
+        try {
+          let content = "";
+          await ops.exec(`base64 -w0 ${workspacePath}/output/${fname} 2>/dev/null`, bashCwd, {
+            onData: (d) => { content += d.toString(); },
+            timeout: 30,
+          });
+          if (content.trim()) {
+            const buf = Buffer.from(content.trim(), "base64");
+            // Gzip wasm
+            if (fname === "index.wasm") {
+              const { gzipSync } = await import("zlib");
+              writeFileSync(join(previewDir, "index.wasm.gz"), gzipSync(buf));
+            } else {
+              writeFileSync(join(previewDir, fname), buf);
+            }
+          }
+        } catch {}
+      }
+
+      // Write standalone HTML
+      const title = project_name || concept;
+      writeFileSync(join(previewDir, "index.html"), buildStandaloneHtml(title, day || 0));
+      previewUrl = `/preview/${sessionId}/`;
     }
+
+    // Store session info
+    sessions.set(sessionId, {
+      day: day || 0,
+      title: project_name || concept,
+      concept,
+      success: succeeded,
+      previewUrl,
+      pckBase64,
+      code: code.slice(0, 50000),
+      steps: stepCount,
+      model: modelId,
+      createdAt: Date.now(),
+    });
 
     send({
       type: "done",
       success: succeeded,
       day: day || 0,
-      code: code.slice(0, 50000),
-      pck_base64: pckBase64,
+      preview_url: previewUrl,
       pck_size: pckBase64 ? Buffer.from(pckBase64, "base64").length : 0,
-      ghpages_url: ghpagesUrl,
       steps: stepCount,
       model: modelId,
       session_id: sessionId,
@@ -340,11 +391,175 @@ ensureCrossOriginIsolationHeaders:false,experimentalVK:false,emscriptenPoolSize:
 </script></body></html>`;
 }
 
+// ── Deploy to GitHub Pages ───────────────────────────────────────────
+
+app.post("/deploy", checkAuth, async (req, res) => {
+  const { session_id, day } = req.body;
+  const session = sessions.get(session_id);
+  if (!session || !session.success) {
+    return res.status(404).json({ error: "Session not found or build failed" });
+  }
+  if (!GITHUB_TOKEN) {
+    return res.status(500).json({ error: "GITHUB_TOKEN not configured" });
+  }
+  const deployDay = day || session.day;
+  if (!deployDay) {
+    return res.status(400).json({ error: "day number required" });
+  }
+
+  try {
+    // Read files from preview dir
+    const previewDir = join(PREVIEWS_DIR, session_id);
+    const pckBytes = Buffer.from(session.pckBase64, "base64");
+    const dayPadded = String(deployDay).padStart(5, "0");
+    const basePath = `builds/day-${dayPadded}`;
+    const msg = `Build day ${deployDay}: ${session.title}`;
+
+    await ghPutFile(`${basePath}/index.pck`, pckBytes, msg);
+
+    // Push runtime files from preview
+    for (const fname of ["index.js", "index.wasm.gz", "index.audio.worklet.js", "index.audio.position.worklet.js"]) {
+      const fpath = join(previewDir, fname);
+      if (existsSync(fpath)) {
+        await ghPutFile(`${basePath}/${fname}`, readFileSync(fpath), msg);
+      }
+    }
+
+    // Push HTML
+    await ghPutFile(`${basePath}/index.html`, Buffer.from(buildStandaloneHtml(session.title, deployDay)), msg);
+
+    const url = `https://potnoodledev.github.io/game-a-day-godot-games/${basePath}/`;
+    res.json({ success: true, ghpages_url: url, day: deployDay });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── List sessions ───────────────────────────────────────────────────
+
+app.get("/sessions", (req, res) => {
+  const list = [];
+  for (const [id, s] of sessions) {
+    list.push({ id, day: s.day, title: s.title, concept: s.concept, success: s.success, preview_url: s.previewUrl, steps: s.steps, model: s.model, created: s.createdAt });
+  }
+  list.sort((a, b) => b.created - a.created);
+  res.json(list);
+});
+
+// ── Frontend ────────────────────────────────────────────────────────
+
+app.get("/", (req, res) => {
+  res.send(FRONTEND_HTML);
+});
+
+const FRONTEND_HTML = `<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Game-A-Day Builder</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:system-ui;background:#0a0a1a;color:#ccc;padding:20px;max-width:800px;margin:0 auto}
+h1{color:#ff6d33;margin-bottom:8px;font-size:1.5em}
+.subtitle{color:#666;margin-bottom:20px;font-size:0.85em}
+.form{display:flex;gap:8px;margin-bottom:16px}
+.form input{flex:1;padding:10px;background:#1a1a2e;border:1px solid #333;border-radius:8px;color:#eee;font-size:14px}
+.form button{padding:10px 20px;background:#ff6d33;color:#fff;border:none;border-radius:8px;font-weight:700;cursor:pointer}
+.form button:disabled{opacity:0.5;cursor:not-allowed}
+#log{background:#111;border:1px solid #222;border-radius:8px;padding:12px;font-family:monospace;font-size:12px;
+  max-height:300px;overflow-y:auto;margin-bottom:16px;white-space:pre-wrap;display:none}
+#preview-frame{width:100%;height:500px;border:1px solid #333;border-radius:8px;background:#000;display:none}
+#result{margin-bottom:16px;display:none}
+#result a{color:#ff6d33}
+.sessions{margin-top:20px}
+.session{background:#1a1a2e;border:1px solid #222;border-radius:8px;padding:10px;margin-bottom:8px;display:flex;justify-content:space-between;align-items:center}
+.session-title{font-weight:600;color:#eee}
+.session-meta{font-size:0.8em;color:#666}
+.session-links a{color:#ff6d33;text-decoration:none;margin-left:8px;font-size:0.85em}
+.deploy-btn{background:#333;color:#ff6d33;border:1px solid #ff6d33;border-radius:6px;padding:4px 10px;cursor:pointer;font-size:0.8em;margin-left:8px}
+</style></head><body>
+<h1>Game-A-Day Builder</h1>
+<p class="subtitle">Enter a game concept — AI writes the code, Godot builds it, you play it.</p>
+<div class="form">
+  <input id="concept" placeholder="e.g. space invaders with powerups" />
+  <button id="build-btn" onclick="generate()">Build</button>
+</div>
+<div id="log"></div>
+<div id="result"></div>
+<iframe id="preview-frame"></iframe>
+<div class="sessions" id="sessions"></div>
+<script>
+const log=document.getElementById('log'),result=document.getElementById('result'),frame=document.getElementById('preview-frame');
+let building=false;
+
+async function generate(){
+  if(building)return;
+  const concept=document.getElementById('concept').value.trim();
+  if(!concept)return;
+  building=true;
+  document.getElementById('build-btn').disabled=true;
+  log.style.display='block';log.textContent='Starting...\\n';
+  result.style.display='none';frame.style.display='none';
+
+  const res=await fetch('/generate-game',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({concept,project_name:concept.slice(0,30),api_key:''})});
+  const reader=res.body.getReader();
+  const decoder=new TextDecoder();
+  let buf='';
+
+  while(true){
+    const{done,value}=await reader.read();
+    if(done)break;
+    buf+=decoder.decode(value,{stream:true});
+    const lines=buf.split('\\n');
+    buf=lines.pop();
+    for(const line of lines){
+      if(!line.startsWith('data: '))continue;
+      try{
+        const d=JSON.parse(line.slice(6));
+        if(d.type==='status')log.textContent+=d.message+'\\n';
+        else if(d.type==='tool')log.textContent+='  step '+d.step+': '+d.command.slice(0,100)+'\\n';
+        else if(d.type==='build_output')log.textContent+='  >> '+d.output.slice(0,150)+'\\n';
+        else if(d.type==='done'){
+          if(d.success&&d.preview_url){
+            result.innerHTML='<b>Build succeeded!</b> <a href="'+d.preview_url+'" target="_blank">Open in new tab</a>';
+            result.style.display='block';
+            frame.src=d.preview_url;frame.style.display='block';
+          }else{
+            result.innerHTML='<b>Build failed</b> ('+d.steps+' steps)';
+            result.style.display='block';
+          }
+          log.textContent+=d.success?'\\n✅ BUILD SUCCESS\\n':'\\n❌ BUILD FAILED\\n';
+        }
+        log.scrollTop=log.scrollHeight;
+      }catch{}
+    }
+  }
+  building=false;
+  document.getElementById('build-btn').disabled=false;
+  loadSessions();
+}
+
+async function loadSessions(){
+  try{
+    const res=await fetch('/sessions');
+    const list=await res.json();
+    const el=document.getElementById('sessions');
+    if(!list.length){el.innerHTML='';return;}
+    el.innerHTML='<h3 style="color:#888;margin-bottom:8px">Recent Builds</h3>'+list.map(s=>
+      '<div class="session"><div><span class="session-title">'+s.title+'</span>'+
+      '<div class="session-meta">'+(s.success?'✅':'❌')+' '+s.steps+' steps · '+s.model.split('/').pop()+'</div></div>'+
+      '<div class="session-links">'+(s.preview_url?'<a href="'+s.preview_url+'" target="_blank">Play</a>':'')+
+      '</div></div>'
+    ).join('');
+  }catch{}
+}
+loadSessions();
+</script></body></html>`;
+
 // ── Existing raw build endpoint ─────────────────────────────────────
 
 app.post("/build", checkAuth, async (req, res) => {
-  // Keep the Python server for raw builds, or reimplement here
-  res.json({ message: "Use /generate-game for autonomous builds" });
+  res.json({ message: "Use /generate-game for autonomous builds, or visit / for the web UI" });
 });
 
 // ── Start ───────────────────────────────────────────────────────────
