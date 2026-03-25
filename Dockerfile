@@ -2,7 +2,12 @@ FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y \
-    wget unzip python3 python3-pip git ca-certificates \
+    wget unzip python3 git ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Node.js 22
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y nodejs \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Godot 4.6.1 headless
@@ -20,9 +25,12 @@ RUN mkdir -p /root/.local/share/godot/export_templates/${GODOT_VERSION}.stable \
     && mv templates/* /root/.local/share/godot/export_templates/${GODOT_VERSION}.stable/ \
     && rm -rf templates *.tpz
 
+# Install pi coding agent
+RUN npm install -g @mariozechner/pi-coding-agent
+
 WORKDIR /app
-COPY requirements.txt .
-RUN pip3 install --break-system-packages -r requirements.txt
+COPY package.json package-lock.json ./
+RUN npm install
 
 COPY . /app
 
@@ -32,5 +40,7 @@ RUN cp -r /app/template /tmp/prebuild \
     && godot --headless --path /tmp/prebuild --import 2>&1 || true \
     && rm -rf /tmp/prebuild
 
+RUN mkdir -p /workspace
+
 EXPOSE 8080
-CMD ["gunicorn", "-b", "0.0.0.0:8080", "-w", "2", "--timeout", "120", "server:app"]
+CMD ["node", "server.js"]
