@@ -31,6 +31,56 @@ const SKILL_TEMPLATES_DIR = join(__dirname, "skill-templates");
 const app = express();
 app.use(express.json({ limit: "50mb" }));
 
+// ── Pi agent config (NIM models) ────────────────────────────────────
+
+function setupPiConfig() {
+  const piDir = join(homedir(), ".pi", "agent");
+  mkdirSync(piDir, { recursive: true });
+
+  const provider = process.env.LLM_PROVIDER || "nvidia-nim";
+  const modelsPath = join(piDir, "models.json");
+
+  if (provider === "nvidia-nim" && LLM_API_KEY) {
+    const modelsConfig = {
+      providers: {
+        "nvidia-nim": {
+          baseUrl: "https://integrate.api.nvidia.com/v1",
+          apiKey: LLM_API_KEY,
+          api: "openai-completions",
+          models: [
+            {
+              id: "moonshotai/kimi-k2.5",
+              name: "Kimi K2.5",
+              contextWindow: 131072,
+              maxTokens: 8192,
+              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+            },
+            {
+              id: "deepseek-ai/deepseek-r1",
+              name: "DeepSeek R1",
+              reasoning: true,
+              contextWindow: 131072,
+              maxTokens: 16384,
+              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+            },
+            {
+              id: "qwen/qwen3-coder-480b-a35b-instruct",
+              name: "Qwen3 Coder",
+              contextWindow: 131072,
+              maxTokens: 8192,
+              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+            },
+          ],
+        },
+      },
+    };
+    writeFileSync(modelsPath, JSON.stringify(modelsConfig, null, 2));
+    console.log(`[config] Wrote NIM models to ${modelsPath}`);
+  }
+}
+
+setupPiConfig();
+
 // ── Auth middleware ──────────────────────────────────────────────────
 
 function checkAuth(req, res, next) {
@@ -61,12 +111,11 @@ class PiRpcProcess {
     const args = ["--mode", "rpc", "--cwd", cwd];
     if (systemPrompt) args.push("--system-prompt", systemPrompt);
 
-    // Pass LLM provider/key/model to pi agent
-    const provider = process.env.LLM_PROVIDER || "google";
-    const model = process.env.LLM_MODEL || "";
-    if (provider) args.push("--provider", provider);
-    if (model) args.push("--model", model);
-    if (LLM_API_KEY) args.push("--api-key", LLM_API_KEY);
+    // Pass LLM provider/model to pi agent
+    const provider = process.env.LLM_PROVIDER || "nvidia-nim";
+    const model = process.env.LLM_MODEL || "moonshotai/kimi-k2.5";
+    args.push("--provider", provider);
+    args.push("--model", model);
 
     this.process = spawn(PI_BIN, args, {
       cwd,
@@ -167,16 +216,20 @@ app.post("/generate-game", checkAuth, async (req, res) => {
       }, 5 * 60 * 1000);
 
       rpc.addListener((msg) => {
-        if (msg.type === "thinking" || msg.type === "text") {
-          agentLog.push(msg.content || "");
-        }
-        if (msg.type === "tool_use") {
-          agentLog.push(`[tool] ${msg.tool}: ${(msg.input || "").slice(0, 200)}`);
+        // Log different event types
+        if (msg.type === "message_update") {
+          const evt = msg.assistantMessageEvent;
+          if (evt?.type === "text_delta") {
+            agentLog.push(evt.delta || "");
+          } else if (evt?.type === "tool_use_start") {
+            agentLog.push(`[tool] ${evt.name || evt.tool || "?"}`);
+          }
         }
         if (msg.type === "tool_result") {
-          agentLog.push(`[result] ${(msg.output || "").slice(0, 500)}`);
+          const output = typeof msg.output === "string" ? msg.output : JSON.stringify(msg.output || "");
+          agentLog.push(`[result] ${output.slice(0, 500)}`);
         }
-        if (msg.type === "response" || msg.type === "result") {
+        if (msg.type === "agent_end") {
           clearTimeout(timeout);
           resolve(msg);
         }
