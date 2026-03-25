@@ -19,6 +19,9 @@
   },
   "homepage": "https://github.com/potnoodledev/godot-build-service#readme",
   "dependencies": {
+    "@mariozechner/pi-agent-core": "^0.62.0",
+    "@mariozechner/pi-ai": "^0.62.0",
+    "@mariozechner/pi-coding-agent": "^0.62.0",
     "express": "^5.2.1"
   }
 }
