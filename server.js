@@ -284,6 +284,7 @@ h1{color:#ff6d33;margin-bottom:4px}p.sub{color:#666;margin-bottom:16px;font-size
 iframe{width:100%;height:500px;border:1px solid #333;border-radius:8px;background:#000;display:none}
 .sessions{margin-top:16px}.session{background:#1a1a2e;border:1px solid #222;border-radius:8px;padding:10px;margin-bottom:6px;display:flex;justify-content:space-between;align-items:center}
 .s-title{font-weight:600;color:#eee;font-size:.9em}.s-meta{font-size:.75em;color:#666}.s-links a{color:#ff6d33;text-decoration:none;font-size:.85em}
+.retry-btn{background:#333;color:#ff6d33;border:1px solid #ff6d33;border-radius:6px;padding:3px 10px;cursor:pointer;font-size:.8em;margin-left:8px}
 </style></head><body>
 <h1>Game-A-Day Builder</h1><p class="sub">Enter a concept. AI writes the code, Godot builds it, you play it.</p>
 <div class="form"><input id="concept" placeholder="e.g. asteroid dodger with powerups"><button id="btn" onclick="go()">Build</button></div>
@@ -293,24 +294,18 @@ iframe{width:100%;height:500px;border:1px solid #333;border-radius:8px;backgroun
 const log=document.getElementById('log'),result=document.getElementById('result'),frame=document.getElementById('frame'),btn=document.getElementById('btn');
 function addLog(s){log.textContent+=s+'\\n';log.scrollTop=log.scrollHeight;}
 
-function go(){
-  const concept=document.getElementById('concept').value.trim();
-  if(!concept)return;
+function startBuild(wsMsg){
   btn.disabled=true;log.style.display='block';log.textContent='';result.style.display='none';frame.style.display='none';
-
   const proto=location.protocol==='https:'?'wss:':'ws:';
   const ws=new WebSocket(proto+'//'+location.host+'/ws');
-  ws.onopen=()=>{
-    addLog('Connected. Sending concept...');
-    ws.send(JSON.stringify({type:'generate',concept,project_name:concept.slice(0,30)}));
-  };
+  ws.onopen=()=>{addLog('Connected...');ws.send(JSON.stringify(wsMsg));};
   ws.onmessage=(e)=>{
     try{
       const d=JSON.parse(e.data);
       if(d.type==='status')addLog('>> '+d.message);
       else if(d.type==='thinking')addLog('\\n💭 '+d.message);
-      else if(d.type==='thinking_delta'){document.getElementById('log').textContent+=d.content;}
-      else if(d.type==='text_delta'){document.getElementById('log').textContent+=d.content;}
+      else if(d.type==='thinking_delta'){log.textContent+=d.content;log.scrollTop=log.scrollHeight;}
+      else if(d.type==='text_delta'){log.textContent+=d.content;log.scrollTop=log.scrollHeight;}
       else if(d.type==='tool')addLog('\\n🔧 step '+d.step+': '+d.command.slice(0,120));
       else if(d.type==='tool_result')addLog('  → '+d.output.slice(0,200));
       else if(d.type==='done'){
@@ -320,11 +315,21 @@ function go(){
           result.style.display='block';frame.src=d.preview_url;frame.style.display='block';
         }
         btn.disabled=false;ws.close();loadSessions();
-      }else if(d.type==='error'){addLog('ERROR: '+d.error);btn.disabled=false;ws.close();}
+      }else if(d.type==='error'){addLog('ERROR: '+d.error);btn.disabled=false;ws.close();loadSessions();}
     }catch{}
   };
-  ws.onerror=()=>{addLog('WebSocket error');btn.disabled=false;};
-  ws.onclose=()=>{if(btn.disabled){addLog('Connection closed');btn.disabled=false;}};
+  ws.onerror=()=>{addLog('WebSocket error');btn.disabled=false;loadSessions();};
+  ws.onclose=()=>{if(btn.disabled){addLog('Connection closed');btn.disabled=false;loadSessions();}};
+}
+
+function go(){
+  const concept=document.getElementById('concept').value.trim();
+  if(!concept)return;
+  startBuild({type:'generate',concept,project_name:concept.slice(0,30)});
+}
+
+function retry(sessionId){
+  startBuild({type:'retry',session_id:sessionId});
 }
 
 async function loadSessions(){
@@ -332,7 +337,10 @@ async function loadSessions(){
   if(!list.length){el.innerHTML='';return;}
   el.innerHTML='<h3 style="color:#888;margin-bottom:8px;font-size:.9em">Recent Builds</h3>'+list.slice(0,10).map(s=>
     '<div class="session"><div><span class="s-title">'+s.title+'</span><div class="s-meta">'+(s.success?'✅':'❌')+' '+s.steps+' steps · '+s.model.split('/').pop()+'</div></div>'+
-    '<div class="s-links">'+(s.preview_url?'<a href="'+s.preview_url+'" target="_blank">Play</a>':'')+'</div></div>'
+    '<div class="s-links">'+
+    (s.preview_url?'<a href="'+s.preview_url+'" target="_blank">Play</a>':'')+
+    (!s.success?'<button class="retry-btn" onclick="retry(\\''+s.id+'\\')">Retry</button>':'')+
+    '</div></div>'
   ).join('');}catch{}
 }
 loadSessions();
@@ -353,6 +361,15 @@ wss.on("connection", (ws) => {
       if (msg.type === "generate") {
         const sessionId = randomUUID().slice(0, 8);
         await runBuild(sessionId, msg.concept, msg.project_name, msg.day, send);
+      } else if (msg.type === "retry") {
+        // Retry a previous session's concept
+        const prev = sessions.get(msg.session_id);
+        if (prev) {
+          const sessionId = randomUUID().slice(0, 8);
+          await runBuild(sessionId, prev.concept, prev.title, prev.day, send);
+        } else {
+          send({ type: "error", error: "Session not found" });
+        }
       }
     } catch (err) {
       send({ type: "error", error: err.message });
