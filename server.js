@@ -20,6 +20,7 @@ import { streamSimple } from "@mariozechner/pi-ai";
 import { createBashTool } from "@mariozechner/pi-coding-agent";
 import { DockerBashOperations } from "./docker-bash-ops.js";
 import { LocalBashOperations } from "./local-bash-ops.js";
+import { createCohereStreamFn } from "./cohere-stream.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -204,9 +205,12 @@ async function runBuild(sessionId, concept, projectName, day, send, modelKey) {
     let stepCount = 0;
     let succeeded = false;
 
+    const isCohere = modelSpec.provider === "cohere";
+    const streamFn = isCohere ? createCohereStreamFn(COHERE_API_KEY) : streamSimple;
+
     const agent = new Agent({
       initialState: { systemPrompt, model, tools: [bashTool], thinkingLevel: "off" },
-      streamFn: streamSimple,
+      streamFn,
       getApiKey: () => getApiKeyForModel(modelKey),
     });
 
