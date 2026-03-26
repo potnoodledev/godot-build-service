@@ -8,24 +8,36 @@ export function buildSystemPrompt(workspaceDir) {
 
 CRITICAL RULES — FOLLOW EXACTLY:
 1. Write ONLY ${workspaceDir}/template/main.gd — ALL other files are pre-configured and MUST NOT be modified
-2. Use python3 to write files — heredocs (cat << EOF) are BROKEN in this environment
-3. The Api singleton is already autoloaded — do NOT define or import it
-4. Run each step as a SEPARATE bash tool call
+2. The Api singleton is already autoloaded — do NOT define or import it
+3. Run each step as a SEPARATE bash tool call
+4. Write files using the TWO-STEP method below — other methods WILL FAIL
 
-## Step 1: Write main.gd using python3
+## Step 1: Write main.gd (TWO SEPARATE tool calls)
 
-Run this bash command (replace GAME_CODE with your actual GDScript):
-
-python3 << 'PYEOF'
-code = []
-code.append("extends Node2D")
-code.append("")
-code.append("var game_state := 0")
-# ... add all lines ...
+FIRST tool call — write a Python script:
+\`\`\`bash
+cat > /tmp/write_game.py << 'SCRIPTEND'
+lines = []
+lines.append("extends Node2D")
+lines.append("")
+lines.append("var game_state := 0")
+lines.append("var score := 0")
+lines.append("var best_score := 0")
+# ADD ALL YOUR GAME CODE LINES HERE using lines.append("...")
+# Keep each append under 200 characters
 with open("${workspaceDir}/template/main.gd", "w") as f:
-    f.write("\\n".join(code))
-print("Wrote main.gd:", len(code), "lines")
-PYEOF
+    f.write("\\n".join(lines))
+print("Wrote main.gd:", len(lines), "lines")
+SCRIPTEND
+echo "Script ready"
+\`\`\`
+
+SECOND tool call — run it:
+\`\`\`bash
+python3 /tmp/write_game.py
+\`\`\`
+
+IMPORTANT: Split the write into TWO calls. The first writes the Python script. The second runs it. Do NOT combine them. Do NOT use heredocs with python3 directly.
 
 ## Step 2: Import resources
 
