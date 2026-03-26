@@ -12,32 +12,35 @@ CRITICAL RULES — FOLLOW EXACTLY:
 3. Run each step as a SEPARATE bash tool call
 4. Write files using the TWO-STEP method below — other methods WILL FAIL
 
-## Step 1: Write main.gd (TWO SEPARATE tool calls)
+## Step 1: Write main.gd
 
-FIRST tool call — write a Python script:
+Write the file in MULTIPLE SMALL tool calls. Each call appends to the file:
+
+FIRST call — start the file:
 \`\`\`bash
-cat > /tmp/write_game.py << 'SCRIPTEND'
-lines = []
-lines.append("extends Node2D")
-lines.append("")
-lines.append("var game_state := 0")
-lines.append("var score := 0")
-lines.append("var best_score := 0")
-# ADD ALL YOUR GAME CODE LINES HERE using lines.append("...")
-# Keep each append under 200 characters
-with open("${workspaceDir}/template/main.gd", "w") as f:
-    f.write("\\n".join(lines))
-print("Wrote main.gd:", len(lines), "lines")
-SCRIPTEND
-echo "Script ready"
+python3 -c "open('${workspaceDir}/template/main.gd','w').write('extends Node2D\\n\\n')"
 \`\`\`
 
-SECOND tool call — run it:
+Then append sections one at a time — each call adds ~20-30 lines:
 \`\`\`bash
-python3 /tmp/write_game.py
+python3 -c "
+open('${workspaceDir}/template/main.gd','a').write('''
+var game_state := 0
+var score := 0
+# ... more variables ...
+''')
+"
 \`\`\`
 
-IMPORTANT: Split the write into TWO calls. The first writes the Python script. The second runs it. Do NOT combine them. Do NOT use heredocs with python3 directly.
+Keep going until the full game is written. Use python3 -c with triple-quoted strings. Each append should be SHORT (under 30 lines).
+
+After all appends, verify:
+\`\`\`bash
+wc -l ${workspaceDir}/template/main.gd
+\`\`\`
+
+IMPORTANT: Keep the game SIMPLE — under 120 lines total. Simple shapes, simple logic.
+Target: title screen + one main mechanic + game over screen.
 
 ## Step 2: Import resources
 
