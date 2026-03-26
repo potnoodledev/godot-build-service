@@ -28,16 +28,20 @@ const GITHUB_REPO = process.env.GITHUB_REPO || "potnoodledev/game-a-day-godot-ga
 const NIM_API_KEY = process.env.LLM_API_KEY || process.env.NVIDIA_NIM_API_KEY || "";
 const COHERE_API_KEY = process.env.COHERE_API_KEY || "";
 const GEMINI_API_KEY = process.env.GOOGLE_GEMINI_API_KEY || "";
+const MISTRAL_API_KEY = process.env.MISTRAL_API_KEY || "";
+const ZHIPU_API_KEY = process.env.ZHIPU_AI_BIGMODEL_CN_KEY || "";
 const DOCKER_IMAGE = process.env.DOCKER_IMAGE || "godot-build";
 const MAX_STEPS = 30;
 
 // Available models
 const MODELS = {
   "gemini-2.5-flash": { id: "gemini-2.5-flash", provider: "gemini", name: "Gemini 2.5 Flash", baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai", maxTokens: 16384 },
+  "mistral-large": { id: "mistral-large-latest", provider: "mistral", name: "Mistral Large", baseUrl: "https://api.mistral.ai/v1", maxTokens: 16384 },
+  "glm-4-plus": { id: "glm-4-plus", provider: "zhipu", name: "GLM-4 Plus", baseUrl: "https://open.bigmodel.cn/api/paas/v4", maxTokens: 8192 },
   "kimi-k2.5": { id: "moonshotai/kimi-k2.5", provider: "nim", name: "Kimi K2.5", baseUrl: "https://integrate.api.nvidia.com/v1", maxTokens: 16384 },
   "command-a": { id: "command-a-03-2025", provider: "cohere", name: "Command A", baseUrl: "https://api.cohere.ai/compatibility/v1", maxTokens: 8192 },
 };
-const DEFAULT_MODEL = GEMINI_API_KEY ? "gemini-2.5-flash" : COHERE_API_KEY ? "command-a" : "kimi-k2.5";
+const DEFAULT_MODEL = MISTRAL_API_KEY ? "mistral-large" : GEMINI_API_KEY ? "gemini-2.5-flash" : "kimi-k2.5";
 
 let HAS_DOCKER = false;
 try { execSync("docker info", { stdio: "pipe" }); HAS_DOCKER = true; } catch {}
@@ -88,7 +92,8 @@ app.get("/health", (req, res) => {
 app.get("/models", (req, res) => {
   const available = {};
   for (const [key, spec] of Object.entries(MODELS)) {
-    const hasKey = spec.provider === "gemini" ? !!GEMINI_API_KEY : spec.provider === "cohere" ? !!COHERE_API_KEY : !!NIM_API_KEY;
+    const keyMap = { gemini: GEMINI_API_KEY, mistral: MISTRAL_API_KEY, zhipu: ZHIPU_API_KEY, cohere: COHERE_API_KEY, nim: NIM_API_KEY };
+    const hasKey = !!(keyMap[spec.provider] || NIM_API_KEY);
     if (hasKey) available[key] = { name: spec.name, provider: spec.provider };
   }
   res.json({ models: available, default: DEFAULT_MODEL });
@@ -124,6 +129,8 @@ app.get("/sessions/:id", (req, res) => {
 function getApiKeyForModel(modelKey) {
   const spec = MODELS[modelKey] || MODELS[DEFAULT_MODEL];
   if (spec.provider === "gemini") return GEMINI_API_KEY;
+  if (spec.provider === "mistral") return MISTRAL_API_KEY;
+  if (spec.provider === "zhipu") return ZHIPU_API_KEY;
   if (spec.provider === "cohere") return COHERE_API_KEY;
   return NIM_API_KEY;
 }

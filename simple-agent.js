@@ -51,6 +51,7 @@ export class SimpleAgent {
     }];
 
     let step = 0;
+    let textOnlyTurns = 0; // Track turns with text but no tool calls
     while (step < this.maxSteps && !this.aborted) {
       // Call the LLM
       let response;
@@ -105,8 +106,10 @@ export class SimpleAgent {
           });
         }
       } else {
-        // No tool calls — model is done
-        break;
+        // No tool calls — nudge the model to use tools (up to 3 times)
+        textOnlyTurns++;
+        if (textOnlyTurns >= 3) break;
+        messages.push({ role: "user", content: "Please use the bash tool to execute the commands. Do not output code as text." });
       }
     }
 
