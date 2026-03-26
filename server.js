@@ -80,7 +80,7 @@ app.get("/health", (req, res) => {
 app.get("/sessions", (req, res) => {
   const list = [];
   for (const [id, s] of sessions) {
-    list.push({ id, day: s.day, title: s.title, concept: s.concept, success: s.success, preview_url: s.previewUrl, steps: s.steps, model: s.model, created: s.createdAt, log: s.log?.slice(-20) });
+    list.push({ id, day: s.day, title: s.title, concept: s.concept, success: s.success, status: s.status, preview_url: s.previewUrl, steps: s.steps, model: s.model, created: s.createdAt });
   }
   list.sort((a, b) => b.created - a.created);
   res.json(list);
@@ -320,23 +320,34 @@ app.get("/", (req, res) => { res.send(FRONTEND_HTML); });
 
 const FRONTEND_HTML = `<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Game Builder</title>
 <style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:system-ui;background:#0a0a1a;color:#ccc;padding:20px;max-width:900px;margin:0 auto}
-h1{color:#ff6d33;margin-bottom:4px}p.sub{color:#666;margin-bottom:16px;font-size:.85em}
+h1{color:#ff6d33;margin-bottom:4px;display:flex;align-items:center;gap:10px}
+.ws-dot{width:10px;height:10px;border-radius:50%;background:#444;flex-shrink:0}
+.ws-dot.connected{background:#4caf50}.ws-dot.building{background:#ff6d33;animation:pulse .8s infinite alternate}
+@keyframes pulse{from{opacity:.4}to{opacity:1}}
+@keyframes spin{to{transform:rotate(360deg)}}
+p.sub{color:#666;margin-bottom:16px;font-size:.85em}
 .form{display:flex;gap:8px;margin-bottom:12px}.form input{flex:1;padding:10px;background:#1a1a2e;border:1px solid #333;border-radius:8px;color:#eee;font-size:14px}
-.form button{padding:10px 20px;background:#ff6d33;color:#fff;border:none;border-radius:8px;font-weight:700;cursor:pointer}.form button:disabled{opacity:.5}
-#log{background:#111;border:1px solid #222;border-radius:8px;padding:12px;font:12px monospace;max-height:250px;overflow-y:auto;margin-bottom:12px;white-space:pre-wrap;display:none}
+.form button{padding:10px 20px;background:#ff6d33;color:#fff;border:none;border-radius:8px;font-weight:700;cursor:pointer;display:flex;align-items:center;gap:6px}.form button:disabled{opacity:.5}
+.spinner{width:14px;height:14px;border:2px solid rgba(255,255,255,.3);border-top-color:#fff;border-radius:50%;animation:spin .6s linear infinite;display:none}
+.form button:disabled .spinner{display:block}
+#log{background:#111;border:1px solid #222;border-radius:8px;padding:12px;font:12px monospace;max-height:300px;overflow-y:auto;margin-bottom:12px;white-space:pre-wrap;display:none}
 #result{margin-bottom:12px;display:none}#result a{color:#ff6d33}
 iframe{width:100%;height:500px;border:1px solid #333;border-radius:8px;background:#000;display:none}
 .sessions{margin-top:16px}.session{background:#1a1a2e;border:1px solid #222;border-radius:8px;padding:10px;margin-bottom:6px;display:flex;justify-content:space-between;align-items:center}
 .s-title{font-weight:600;color:#eee;font-size:.9em}.s-meta{font-size:.75em;color:#666}.s-links a{color:#ff6d33;text-decoration:none;font-size:.85em}
 .retry-btn{background:#333;color:#ff6d33;border:1px solid #ff6d33;border-radius:6px;padding:3px 10px;cursor:pointer;font-size:.8em;margin-left:8px}
 </style></head><body>
-<h1>Game-A-Day Builder</h1><p class="sub">Enter a concept. AI writes the code, Godot builds it, you play it.</p>
-<div class="form"><input id="concept" placeholder="e.g. asteroid dodger with powerups"><button id="btn" onclick="go()">Build</button></div>
+<h1>Game-A-Day Builder <span class="ws-dot" id="ws-dot" title="Disconnected"></span></h1>
+<p class="sub">Enter a concept. AI writes the code, Godot builds it, you play it.</p>
+<div class="form"><input id="concept" placeholder="e.g. asteroid dodger with powerups"><button id="btn" onclick="go()"><span class="spinner" id="spinner"></span><span id="btn-text">Build</span></button></div>
 <div id="log"></div><div id="result"></div><iframe id="frame"></iframe>
 <div class="sessions" id="sessions"></div>
 <script>
 const log=document.getElementById('log'),result=document.getElementById('result'),frame=document.getElementById('frame'),btn=document.getElementById('btn');
+const dot=document.getElementById('ws-dot'),btnText=document.getElementById('btn-text');
 function addLog(s){log.textContent+=s+'\\n';log.scrollTop=log.scrollHeight;}
+function setBuilding(on){btn.disabled=on;btnText.textContent=on?'Building...':'Build';dot.className='ws-dot'+(on?' building':activeWs?' connected':'');}
+function setConnected(on){dot.className='ws-dot'+(on?(btn.disabled?' building':' connected'):'');dot.title=on?'Connected':'Disconnected';}
 
 let activeWs=null;
 
@@ -346,10 +357,10 @@ function handleMsg(d){
   else if(d.type==='thinking_delta'){log.textContent+=d.content;log.scrollTop=log.scrollHeight;}
   else if(d.type==='text_delta'){log.textContent+=d.content;log.scrollTop=log.scrollHeight;}
   else if(d.type==='tool')addLog('\\n🔧 step '+d.step+': '+d.command.slice(0,120));
-  else if(d.type==='tool_result')addLog('  → '+d.output.slice(0,200));
-  else if(d.type==='session')addLog('>> Building: '+d.model);
+  else if(d.type==='tool_result')addLog('  → '+(d.output||'').slice(0,200));
+  else if(d.type==='session'){addLog('>> Building: '+d.model);setBuilding(true);}
   else if(d.type==='active_build'){
-    btn.disabled=true;btn.textContent='Building...';
+    setBuilding(true);
     log.style.display='block';log.textContent='>> Rejoined active build\\n';
   }
   else if(d.type==='done'){
@@ -358,30 +369,30 @@ function handleMsg(d){
       result.innerHTML='<b>Game ready!</b> <a href="'+d.preview_url+'" target="_blank">Open in new tab</a>';
       result.style.display='block';frame.src=d.preview_url;frame.style.display='block';
     }
-    btn.disabled=false;btn.textContent='Build';loadSessions();
-  }else if(d.type==='error'){addLog('ERROR: '+d.error);btn.disabled=false;btn.textContent='Build';loadSessions();}
+    setBuilding(false);loadSessions();
+  }else if(d.type==='error'){addLog('ERROR: '+d.error);setBuilding(false);loadSessions();}
 }
 
 function connectWs(onOpen){
   const proto=location.protocol==='https:'?'wss:':'ws:';
   const ws=new WebSocket(proto+'//'+location.host+'/ws');
-  ws.onopen=()=>{activeWs=ws;if(onOpen)onOpen(ws);};
+  ws.onopen=()=>{activeWs=ws;setConnected(true);if(onOpen)onOpen(ws);};
   ws.onmessage=(e)=>{try{handleMsg(JSON.parse(e.data));}catch{}};
-  ws.onerror=()=>{addLog('WebSocket error');btn.disabled=false;btn.textContent='Build';};
-  ws.onclose=()=>{activeWs=null;if(btn.disabled){addLog('Connection closed');btn.disabled=false;btn.textContent='Build';loadSessions();}};
+  ws.onerror=()=>{addLog('WebSocket error');setBuilding(false);setConnected(false);};
+  ws.onclose=()=>{activeWs=null;setConnected(false);if(btn.disabled){addLog('\\n⚠️ Connection lost');setBuilding(false);loadSessions();}};
   return ws;
 }
 
 function go(){
   const concept=document.getElementById('concept').value.trim();
   if(!concept)return;
-  btn.disabled=true;btn.textContent='Building...';
+  setBuilding(true);
   log.style.display='block';log.textContent='';result.style.display='none';frame.style.display='none';
   connectWs(ws=>ws.send(JSON.stringify({type:'generate',concept,project_name:concept.slice(0,30)})));
 }
 
 function retry(sessionId){
-  btn.disabled=true;btn.textContent='Building...';
+  setBuilding(true);
   log.style.display='block';log.textContent='';result.style.display='none';frame.style.display='none';
   connectWs(ws=>ws.send(JSON.stringify({type:'retry',session_id:sessionId})));
 }
@@ -394,14 +405,16 @@ fetch('/active').then(r=>r.json()).then(d=>{
 async function loadSessions(){
   try{const r=await fetch('/sessions');const list=await r.json();const el=document.getElementById('sessions');
   if(!list.length){el.innerHTML='';return;}
-  el.innerHTML='<h3 style="color:#888;margin-bottom:8px;font-size:.9em">Recent Builds</h3>'+list.slice(0,10).map(s=>
-    '<div class="session"><div><span class="s-title">'+s.title+'</span><div class="s-meta">'+(s.success?'✅':'❌')+' '+s.steps+' steps · '+s.model.split('/').pop()+'</div></div>'+
+  el.innerHTML='<h3 style="color:#888;margin-bottom:8px;font-size:.9em">Recent Builds</h3>'+list.slice(0,10).map(s=>{
+    const icon=s.status==='building'?'🔨':s.success?'✅':'❌';
+    const showRetry=s.status!=='building'&&!s.success;
+    return '<div class="session"><div><span class="s-title">'+s.title+'</span><div class="s-meta">'+icon+' '+(s.status==='building'?'building...':s.steps+' steps')+' · '+s.model.split('/').pop()+'</div></div>'+
     '<div class="s-links">'+
     '<a href="#" onclick="viewSession(\\''+s.id+'\\');return false">Log</a>'+
     (s.preview_url?'<a href="'+s.preview_url+'" target="_blank">Play</a>':'')+
-    (!s.success?'<button class="retry-btn" onclick="retry(\\''+s.id+'\\')">Retry</button>':'')+
-    '</div></div>'
-  ).join('');}catch{}
+    (showRetry?'<button class="retry-btn" onclick="retry(\\''+s.id+'\\')">Retry</button>':'')+
+    '</div></div>';
+  }).join('');}catch{}
 }
 async function viewSession(id){
   try{
