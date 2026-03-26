@@ -15,12 +15,9 @@ import { randomUUID } from "crypto";
 import { gzipSync } from "zlib";
 import { buildSystemPrompt } from "./prompt-builder.js";
 
-import { Agent } from "@mariozechner/pi-agent-core";
-import { streamSimple } from "@mariozechner/pi-ai";
-import { createBashTool } from "@mariozechner/pi-coding-agent";
 import { DockerBashOperations } from "./docker-bash-ops.js";
 import { LocalBashOperations } from "./local-bash-ops.js";
-import { createCohereStreamFn } from "./cohere-stream.js";
+import { SimpleAgent } from "./simple-agent.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -30,15 +27,17 @@ const GITHUB_TOKEN = process.env.GITHUB_TOKEN || "";
 const GITHUB_REPO = process.env.GITHUB_REPO || "potnoodledev/game-a-day-godot-games";
 const NIM_API_KEY = process.env.LLM_API_KEY || process.env.NVIDIA_NIM_API_KEY || "";
 const COHERE_API_KEY = process.env.COHERE_API_KEY || "";
+const GEMINI_API_KEY = process.env.GOOGLE_GEMINI_API_KEY || "";
 const DOCKER_IMAGE = process.env.DOCKER_IMAGE || "godot-build";
 const MAX_STEPS = 30;
 
 // Available models
 const MODELS = {
-  "kimi-k2.5": { id: "moonshotai/kimi-k2.5", provider: "nim", name: "Kimi K2.5" },
-  "command-a": { id: "command-a-03-2025", provider: "cohere", name: "Command A" },
+  "gemini-2.5-flash": { id: "gemini-2.5-flash", provider: "gemini", name: "Gemini 2.5 Flash", baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai", maxTokens: 16384 },
+  "kimi-k2.5": { id: "moonshotai/kimi-k2.5", provider: "nim", name: "Kimi K2.5", baseUrl: "https://integrate.api.nvidia.com/v1", maxTokens: 16384 },
+  "command-a": { id: "command-a-03-2025", provider: "cohere", name: "Command A", baseUrl: "https://api.cohere.ai/compatibility/v1", maxTokens: 8192 },
 };
-const DEFAULT_MODEL = COHERE_API_KEY ? "command-a" : "kimi-k2.5";
+const DEFAULT_MODEL = GEMINI_API_KEY ? "gemini-2.5-flash" : COHERE_API_KEY ? "command-a" : "kimi-k2.5";
 
 let HAS_DOCKER = false;
 try { execSync("docker info", { stdio: "pipe" }); HAS_DOCKER = true; } catch {}
@@ -83,13 +82,13 @@ app.use("/preview", (req, res, next) => {
 // ── Health ──────────────────────────────────────────────────────────
 
 app.get("/health", (req, res) => {
-  res.json({ status: "ok", nim_key: !!NIM_API_KEY, cohere_key: !!COHERE_API_KEY, docker: HAS_DOCKER, local_godot: HAS_LOCAL_GODOT, mode: HAS_DOCKER ? "docker" : "local" });
+  res.json({ status: "ok", nim_key: !!NIM_API_KEY, cohere_key: !!COHERE_API_KEY, gemini_key: !!GEMINI_API_KEY, docker: HAS_DOCKER, local_godot: HAS_LOCAL_GODOT, mode: HAS_DOCKER ? "docker" : "local" });
 });
 
 app.get("/models", (req, res) => {
   const available = {};
   for (const [key, spec] of Object.entries(MODELS)) {
-    const hasKey = spec.provider === "cohere" ? !!COHERE_API_KEY : !!NIM_API_KEY;
+    const hasKey = spec.provider === "gemini" ? !!GEMINI_API_KEY : spec.provider === "cohere" ? !!COHERE_API_KEY : !!NIM_API_KEY;
     if (hasKey) available[key] = { name: spec.name, provider: spec.provider };
   }
   res.json({ models: available, default: DEFAULT_MODEL });
@@ -122,36 +121,11 @@ app.get("/sessions/:id", (req, res) => {
   res.json({ ...safe, id: req.params.id, hasPck: !!pckBase64, log: fileLog });
 });
 
-// ── Model factory ───────────────────────────────────────────────────
-
-function createModel(modelKey) {
-  const spec = MODELS[modelKey] || MODELS[DEFAULT_MODEL];
-  if (spec.provider === "cohere") {
-    return {
-      id: spec.id, name: spec.name,
-      api: "openai-completions", provider: "openai",
-      baseUrl: "https://api.cohere.ai/compatibility/v1",
-      reasoning: false, input: ["text"],
-      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-      contextWindow: 128000, maxTokens: 16384,
-      headers: { Authorization: `Bearer ${COHERE_API_KEY}` },
-    };
-  }
-  // Default: NIM
-  return {
-    id: spec.id, name: spec.name,
-    api: "openai-completions", provider: "openai",
-    baseUrl: "https://integrate.api.nvidia.com/v1",
-    reasoning: false, input: ["text"],
-    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    contextWindow: 131072, maxTokens: 16384,
-    headers: { Authorization: `Bearer ${NIM_API_KEY}` },
-  };
-}
-
 function getApiKeyForModel(modelKey) {
   const spec = MODELS[modelKey] || MODELS[DEFAULT_MODEL];
-  return spec.provider === "cohere" ? COHERE_API_KEY : NIM_API_KEY;
+  if (spec.provider === "gemini") return GEMINI_API_KEY;
+  if (spec.provider === "cohere") return COHERE_API_KEY;
+  return NIM_API_KEY;
 }
 
 // ── Build runner (called from WebSocket) ────────────────────────────
@@ -197,70 +171,43 @@ async function runBuild(sessionId, concept, projectName, day, send, modelKey) {
     }
     broadcast({ type: "status", message: "Workspace ready" });
 
-    // 2. Create agent
-    const model = createModel(modelKey);
-    const bashTool = createBashTool(bashCwd, { operations: ops });
+    // 2. Create agent (simple direct API approach — no pi-agent dependency)
     const systemPrompt = buildSystemPrompt(workspacePath);
+    const apiKey = getApiKeyForModel(modelKey);
 
-    let stepCount = 0;
     let succeeded = false;
 
-    const isCohere = modelSpec.provider === "cohere";
-    const streamFn = isCohere ? createCohereStreamFn(COHERE_API_KEY) : streamSimple;
-
-    const agent = new Agent({
-      initialState: { systemPrompt, model, tools: [bashTool], thinkingLevel: "off" },
-      streamFn,
-      getApiKey: () => getApiKeyForModel(modelKey),
+    const agent = new SimpleAgent({
+      apiKey,
+      baseUrl: modelSpec.baseUrl,
+      model: modelId,
+      systemPrompt,
+      maxSteps: MAX_STEPS,
+      maxTokens: modelSpec.maxTokens,
+      bashCwd,
+      bashOps: ops,
     });
 
-    agent.subscribe((event) => {
-      switch (event.type) {
-        case "message_start":
-          if (event.message?.role === "assistant") {
-            broadcast({ type: "thinking", message: "Thinking..." });
-          }
-          break;
-        case "message_update": {
-          const ae = event.assistantMessageEvent;
-          if (ae?.type === "text_delta" && ae.delta) {
-            broadcast({ type: "text_delta", content: ae.delta });
-          } else if (ae?.type === "thinking_delta" && ae.delta) {
-            broadcast({ type: "thinking_delta", content: ae.delta });
-          }
-          break;
-        }
-        case "message_end":
-          if (event.message?.role === "assistant") {
-            const text = event.message.content?.map((c) => c.text || "").join("") || "";
-            if (text) session.log.push(text.slice(0, 200));
-          }
-          break;
-        case "tool_execution_start": {
-          stepCount++;
-          const cmd = event.args?.command || "";
-          broadcast({ type: "tool", step: stepCount, command: cmd.slice(0, 300) });
-          session.log.push(`step ${stepCount}: ${cmd.slice(0, 100)}`);
-          console.log(`  [${sessionId}] Step ${stepCount}: ${cmd.slice(0, 80)}`);
-          if (stepCount >= MAX_STEPS) agent.abort();
-          break;
-        }
-        case "tool_execution_end": {
-          const rt = typeof event.result === "string" ? event.result : event.result?.content?.map((c) => c.text || "").join("") || "";
-          broadcast({ type: "tool_result", output: rt.slice(0, 2000) });
-          session.log.push(rt.slice(0, 200));
-          if (rt.includes("BUILD_SUCCESS")) succeeded = true;
-          break;
-        }
-      }
+    agent.on("tool", (d) => {
+      broadcast({ type: "tool", step: d.step, command: d.command.slice(0, 300) });
+      console.log(`  [${sessionId}] Step ${d.step}: ${d.command.slice(0, 80)}`);
+    });
+    agent.on("tool_result", (d) => {
+      broadcast({ type: "tool_result", output: d.output.slice(0, 2000) });
+      if (d.output.includes("BUILD_SUCCESS")) succeeded = true;
+    });
+    agent.on("text", (d) => {
+      if (d.content.length > 5) broadcast({ type: "text_delta", content: d.content });
+    });
+    agent.on("error", (d) => {
+      broadcast({ type: "error", error: d.error });
     });
 
     // 3. Run
     broadcast({ type: "status", message: "Agent thinking..." });
-    await agent.prompt(`Build a game for the concept: "${concept}". Title: "${projectName || concept}". Write main.gd, build it, fix errors if needed.`);
-    await agent.waitForIdle();
+    const result = await agent.run(`Build a game for the concept: "${concept}". Title: "${projectName || concept}". Write main.gd, build it, fix errors if needed.`);
 
-    session.steps = stepCount;
+    session.steps = result.steps;
 
     // 4. Collect results
     let code = "", pckBase64 = "";
@@ -299,7 +246,7 @@ async function runBuild(sessionId, concept, projectName, day, send, modelKey) {
     session.status = succeeded ? "done" : "failed";
 
     session.duration = Math.round((Date.now() - startTime) / 1000);
-    broadcast({ type: "done", success: succeeded, preview_url: session.previewUrl, pck_size: pckBase64 ? Buffer.from(pckBase64, "base64").length : 0, steps: stepCount, session_id: sessionId, duration: session.duration, model: modelSpec.name });
+    broadcast({ type: "done", success: succeeded, preview_url: session.previewUrl, pck_size: pckBase64 ? Buffer.from(pckBase64, "base64").length : 0, steps: session.steps, session_id: sessionId, duration: session.duration, model: modelSpec.name });
   } catch (err) {
     console.error(`[generate] Error: ${err.message}`);
     session.status = "error";
