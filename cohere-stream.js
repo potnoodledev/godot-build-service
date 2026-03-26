@@ -1,39 +1,35 @@
 /**
  * Custom streamFn for Cohere that strips unsupported OpenAI fields.
- * Wraps pi-ai's streamSimple but intercepts the fetch to fix the request body.
+ * Patches the global fetch before calling streamSimple, then restores it.
+ * Must be applied at module scope to catch OpenAI SDK's fetch.
  */
 
-const COHERE_BASE = "https://api.cohere.ai/compatibility/v1";
+import { streamSimple } from "@mariozechner/pi-ai";
+
+let cohereApiKey = "";
+
+// Patch fetch ONCE at module load to intercept Cohere requests
+const _origFetch = globalThis.fetch;
+globalThis.fetch = async function patchedFetch(input, init) {
+  const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input?.url || "";
+  if (url.includes("cohere.ai") && init?.body) {
+    try {
+      const body = JSON.parse(init.body);
+      // Strip fields Cohere's compatibility API doesn't support
+      delete body.stream_options;
+      delete body.store;
+      if (body.max_completion_tokens) {
+        body.max_tokens = body.max_completion_tokens;
+        delete body.max_completion_tokens;
+      }
+      init = { ...init, body: JSON.stringify(body) };
+    } catch {}
+  }
+  return _origFetch(input, init);
+};
 
 export function createCohereStreamFn(apiKey) {
-  // Monkey-patch: intercept the fetch call to fix the request body
-  const origFetch = globalThis.fetch;
-
-  return async function cohereStreamFn(model, messages, options) {
-    // Temporarily override fetch to strip unsupported fields
-    globalThis.fetch = async (url, init) => {
-      if (typeof url === "string" && url.includes("cohere.ai")) {
-        try {
-          const body = JSON.parse(init.body);
-          // Remove fields Cohere doesn't support
-          delete body.stream_options;
-          delete body.store;
-          // Cohere uses max_tokens, not max_completion_tokens
-          if (body.max_completion_tokens) {
-            body.max_tokens = body.max_completion_tokens;
-            delete body.max_completion_tokens;
-          }
-          init.body = JSON.stringify(body);
-        } catch {}
-      }
-      return origFetch(url, init);
-    };
-
-    try {
-      const { streamSimple } = await import("@mariozechner/pi-ai");
-      return await streamSimple(model, messages, options);
-    } finally {
-      globalThis.fetch = origFetch;
-    }
-  };
+  cohereApiKey = apiKey;
+  // Just return streamSimple — the global fetch patch handles the rest
+  return streamSimple;
 }
