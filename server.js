@@ -6,6 +6,7 @@ import {
   existsSync,
   readFileSync,
   writeFileSync,
+  appendFileSync,
   mkdirSync,
 } from "fs";
 import { join, dirname } from "path";
@@ -37,11 +38,29 @@ try { execSync("godot --version", { stdio: "pipe" }); HAS_LOCAL_GODOT = true; } 
 
 const TEMPLATE_DIR = join(__dirname, "template");
 const PREVIEWS_DIR = join("/tmp", "previews");
+const SESSIONS_DIR = join("/tmp", "sessions");
 mkdirSync(PREVIEWS_DIR, { recursive: true });
+mkdirSync(SESSIONS_DIR, { recursive: true });
 
 const sessions = new Map();
-let activeSessionId = null; // Currently building session
-const activeListeners = new Set(); // WebSocket clients watching the active build
+let activeSessionId = null;
+const activeListeners = new Set();
+
+// Persist session events to a JSONL file
+function appendSessionLog(sessionId, event) {
+  try {
+    const logFile = join(SESSIONS_DIR, `${sessionId}.jsonl`);
+    appendFileSync(logFile, JSON.stringify(event) + "\n");
+  } catch {}
+}
+
+function readSessionLog(sessionId) {
+  try {
+    const logFile = join(SESSIONS_DIR, `${sessionId}.jsonl`);
+    if (!existsSync(logFile)) return [];
+    return readFileSync(logFile, "utf-8").trim().split("\n").map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+  } catch { return []; }
+}
 
 const app = express();
 app.use(express.json({ limit: "50mb" }));
@@ -79,8 +98,10 @@ app.get("/active", (req, res) => {
 app.get("/sessions/:id", (req, res) => {
   const s = sessions.get(req.params.id);
   if (!s) return res.status(404).json({ error: "Not found" });
-  const { pckBase64, ...safe } = s;
-  res.json({ ...safe, id: req.params.id, hasPck: !!pckBase64 });
+  const { pckBase64, log: memLog, ...safe } = s;
+  // Use file log (ordered) instead of in-memory log
+  const fileLog = readSessionLog(req.params.id);
+  res.json({ ...safe, id: req.params.id, hasPck: !!pckBase64, log: fileLog });
 });
 
 // ── NIM Model ──────────────────────────────────────────────────────
@@ -108,8 +129,9 @@ async function runBuild(sessionId, concept, projectName, day, send) {
   sessions.set(sessionId, session);
   activeSessionId = sessionId;
 
-  // Broadcast to all listeners (including the caller and any watchers)
+  // Broadcast to all listeners and persist to log file
   const broadcast = (data) => {
+    appendSessionLog(sessionId, data);
     send(data);
     for (const listener of activeListeners) {
       if (listener !== send) { try { listener(data); } catch {} }
@@ -328,8 +350,7 @@ function handleMsg(d){
   else if(d.type==='session')addLog('>> Building: '+d.model);
   else if(d.type==='active_build'){
     btn.disabled=true;btn.textContent='Building...';
-    log.style.display='block';log.textContent='>> Rejoined active build: '+d.concept+'\\n';
-    if(d.log)d.log.forEach(l=>addLog(l));
+    log.style.display='block';log.textContent='>> Rejoined active build\\n';
   }
   else if(d.type==='done'){
     addLog(d.success?'\\n✅ BUILD SUCCESS':'\\n❌ BUILD FAILED');
@@ -387,17 +408,22 @@ async function viewSession(id){
     const r=await fetch('/sessions/'+id);
     const s=await r.json();
     log.style.display='block';
-    log.textContent='=== Session '+id+' ===\\n';
-    log.textContent+='Concept: '+s.concept+'\\n';
-    log.textContent+='Title: '+s.title+'\\n';
-    log.textContent+='Model: '+s.model+'\\n';
-    log.textContent+='Status: '+s.status+'\\n';
-    log.textContent+='Steps: '+s.steps+'\\n\\n--- Log ---\\n';
-    if(s.log)s.log.forEach(l=>log.textContent+=l+'\\n');
+    log.textContent='=== '+s.title+' ('+s.status+') ===\\n';
+    log.textContent+='Concept: '+s.concept+'\\nModel: '+s.model+'\\nSteps: '+s.steps+'\\n\\n';
+    if(s.log)s.log.forEach(d=>{
+      if(d.type==='status')log.textContent+='>> '+d.message+'\\n';
+      else if(d.type==='thinking')log.textContent+='\\n💭 '+d.message+'\\n';
+      else if(d.type==='thinking_delta')log.textContent+=d.content;
+      else if(d.type==='text_delta')log.textContent+=d.content;
+      else if(d.type==='tool')log.textContent+='\\n🔧 step '+d.step+': '+d.command+'\\n';
+      else if(d.type==='tool_result')log.textContent+='  → '+(d.output||'').slice(0,300)+'\\n';
+      else if(d.type==='build_output')log.textContent+='  >> '+(d.output||'').slice(0,300)+'\\n';
+      else if(d.type==='done')log.textContent+='\\n'+(d.success?'✅ SUCCESS':'❌ FAILED')+'\\n';
+      else if(d.type==='error')log.textContent+='\\nERROR: '+d.error+'\\n';
+    });
     if(s.previewUrl){
       result.innerHTML='<a href="'+s.previewUrl+'" target="_blank">Play this game</a>';
-      result.style.display='block';
-      frame.src=s.previewUrl;frame.style.display='block';
+      result.style.display='block';frame.src=s.previewUrl;frame.style.display='block';
     }else{result.style.display='none';frame.style.display='none';}
     log.scrollTop=0;
   }catch(e){alert('Failed to load session');}
@@ -414,10 +440,14 @@ wss.on("connection", (ws) => {
   console.log("[ws] Client connected");
   const send = (data) => { try { if (ws.readyState === 1) ws.send(JSON.stringify(data)); } catch {} };
 
-  // If a build is active, subscribe this client to its updates
+  // If a build is active, replay the full log then subscribe to live updates
   if (activeSessionId) {
-    const s = sessions.get(activeSessionId);
-    send({ type: "active_build", session_id: activeSessionId, concept: s?.concept, title: s?.title, steps: s?.steps, log: s?.log?.slice(-30) });
+    const fullLog = readSessionLog(activeSessionId);
+    send({ type: "active_build", session_id: activeSessionId, replay: true });
+    for (const event of fullLog) {
+      send(event);
+    }
+    send({ type: "status", message: "Rejoined — streaming live..." });
     activeListeners.add(send);
   }
 
@@ -437,11 +467,12 @@ wss.on("connection", (ws) => {
         await runBuild(sessionId, concept, title, msg.day, send);
         activeListeners.delete(send);
       } else if (msg.type === "watch") {
-        // Subscribe to active build updates
         activeListeners.add(send);
         if (activeSessionId) {
-          const s = sessions.get(activeSessionId);
-          send({ type: "active_build", session_id: activeSessionId, concept: s?.concept, steps: s?.steps });
+          const fullLog = readSessionLog(activeSessionId);
+          send({ type: "active_build", session_id: activeSessionId, replay: true });
+          for (const event of fullLog) send(event);
+          send({ type: "status", message: "Rejoined — streaming live..." });
         }
       }
     } catch (err) {
