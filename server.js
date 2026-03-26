@@ -68,7 +68,8 @@ app.get("/sessions", (req, res) => {
 app.get("/sessions/:id", (req, res) => {
   const s = sessions.get(req.params.id);
   if (!s) return res.status(404).json({ error: "Not found" });
-  res.json({ ...s, id: req.params.id });
+  const { pckBase64, ...safe } = s;
+  res.json({ ...safe, id: req.params.id, hasPck: !!pckBase64 });
 });
 
 // ── NIM Model ──────────────────────────────────────────────────────
@@ -338,10 +339,31 @@ async function loadSessions(){
   el.innerHTML='<h3 style="color:#888;margin-bottom:8px;font-size:.9em">Recent Builds</h3>'+list.slice(0,10).map(s=>
     '<div class="session"><div><span class="s-title">'+s.title+'</span><div class="s-meta">'+(s.success?'✅':'❌')+' '+s.steps+' steps · '+s.model.split('/').pop()+'</div></div>'+
     '<div class="s-links">'+
+    '<a href="#" onclick="viewSession(\\''+s.id+'\\');return false">Log</a>'+
     (s.preview_url?'<a href="'+s.preview_url+'" target="_blank">Play</a>':'')+
     (!s.success?'<button class="retry-btn" onclick="retry(\\''+s.id+'\\')">Retry</button>':'')+
     '</div></div>'
   ).join('');}catch{}
+}
+async function viewSession(id){
+  try{
+    const r=await fetch('/sessions/'+id);
+    const s=await r.json();
+    log.style.display='block';
+    log.textContent='=== Session '+id+' ===\\n';
+    log.textContent+='Concept: '+s.concept+'\\n';
+    log.textContent+='Title: '+s.title+'\\n';
+    log.textContent+='Model: '+s.model+'\\n';
+    log.textContent+='Status: '+s.status+'\\n';
+    log.textContent+='Steps: '+s.steps+'\\n\\n--- Log ---\\n';
+    if(s.log)s.log.forEach(l=>log.textContent+=l+'\\n');
+    if(s.previewUrl){
+      result.innerHTML='<a href="'+s.previewUrl+'" target="_blank">Play this game</a>';
+      result.style.display='block';
+      frame.src=s.previewUrl;frame.style.display='block';
+    }else{result.style.display='none';frame.style.display='none';}
+    log.scrollTop=0;
+  }catch(e){alert('Failed to load session');}
 }
 loadSessions();
 </script></body></html>`;
