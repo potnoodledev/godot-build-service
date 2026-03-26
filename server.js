@@ -40,6 +40,8 @@ const PREVIEWS_DIR = join("/tmp", "previews");
 mkdirSync(PREVIEWS_DIR, { recursive: true });
 
 const sessions = new Map();
+let activeSessionId = null; // Currently building session
+const activeListeners = new Set(); // WebSocket clients watching the active build
 
 const app = express();
 app.use(express.json({ limit: "50mb" }));
@@ -63,6 +65,15 @@ app.get("/sessions", (req, res) => {
   }
   list.sort((a, b) => b.created - a.created);
   res.json(list);
+});
+
+app.get("/active", (req, res) => {
+  if (activeSessionId) {
+    const s = sessions.get(activeSessionId);
+    res.json({ active: true, session_id: activeSessionId, concept: s?.concept, title: s?.title, steps: s?.steps, log: s?.log?.slice(-30) });
+  } else {
+    res.json({ active: false });
+  }
 });
 
 app.get("/sessions/:id", (req, res) => {
@@ -95,14 +106,23 @@ async function runBuild(sessionId, concept, projectName, day, send) {
 
   const session = { day: day || 0, title: projectName || concept, concept, success: false, previewUrl: "", steps: 0, model: modelId, log: [], createdAt: Date.now(), status: "building" };
   sessions.set(sessionId, session);
+  activeSessionId = sessionId;
+
+  // Broadcast to all listeners (including the caller and any watchers)
+  const broadcast = (data) => {
+    send(data);
+    for (const listener of activeListeners) {
+      if (listener !== send) { try { listener(data); } catch {} }
+    }
+  };
 
   console.log(`[generate] ${sessionId}: "${concept}" (${modelId}, ${useDocker ? "docker" : "local"})`);
-  send({ type: "session", session_id: sessionId, model: modelId });
+  broadcast({ type: "session", session_id: sessionId, model: modelId });
 
   let workspacePath, bashCwd;
   try {
     // 1. Setup workspace
-    send({ type: "status", message: "Setting up workspace..." });
+    broadcast({ type: "status", message: "Setting up workspace..." });
     if (useDocker) {
       ops.createContainer(DOCKER_IMAGE);
       ops.startContainer();
@@ -113,7 +133,7 @@ async function runBuild(sessionId, concept, projectName, day, send) {
       workspacePath = ops.createWorkspace();
       bashCwd = workspacePath;
     }
-    send({ type: "status", message: "Workspace ready" });
+    broadcast({ type: "status", message: "Workspace ready" });
 
     // 2. Create agent
     const model = nimModel(modelId);
@@ -133,15 +153,15 @@ async function runBuild(sessionId, concept, projectName, day, send) {
       switch (event.type) {
         case "message_start":
           if (event.message?.role === "assistant") {
-            send({ type: "thinking", message: "Thinking..." });
+            broadcast({ type: "thinking", message: "Thinking..." });
           }
           break;
         case "message_update": {
           const ae = event.assistantMessageEvent;
           if (ae?.type === "text_delta" && ae.delta) {
-            send({ type: "text_delta", content: ae.delta });
+            broadcast({ type: "text_delta", content: ae.delta });
           } else if (ae?.type === "thinking_delta" && ae.delta) {
-            send({ type: "thinking_delta", content: ae.delta });
+            broadcast({ type: "thinking_delta", content: ae.delta });
           }
           break;
         }
@@ -154,7 +174,7 @@ async function runBuild(sessionId, concept, projectName, day, send) {
         case "tool_execution_start": {
           stepCount++;
           const cmd = event.args?.command || "";
-          send({ type: "tool", step: stepCount, command: cmd.slice(0, 300) });
+          broadcast({ type: "tool", step: stepCount, command: cmd.slice(0, 300) });
           session.log.push(`step ${stepCount}: ${cmd.slice(0, 100)}`);
           console.log(`  [${sessionId}] Step ${stepCount}: ${cmd.slice(0, 80)}`);
           if (stepCount >= MAX_STEPS) agent.abort();
@@ -162,7 +182,7 @@ async function runBuild(sessionId, concept, projectName, day, send) {
         }
         case "tool_execution_end": {
           const rt = typeof event.result === "string" ? event.result : event.result?.content?.map((c) => c.text || "").join("") || "";
-          send({ type: "tool_result", output: rt.slice(0, 2000) });
+          broadcast({ type: "tool_result", output: rt.slice(0, 2000) });
           session.log.push(rt.slice(0, 200));
           if (rt.includes("BUILD_SUCCESS")) succeeded = true;
           break;
@@ -171,7 +191,7 @@ async function runBuild(sessionId, concept, projectName, day, send) {
     });
 
     // 3. Run
-    send({ type: "status", message: "Agent thinking..." });
+    broadcast({ type: "status", message: "Agent thinking..." });
     await agent.prompt(`Build a game for the concept: "${concept}". Title: "${projectName || concept}". Write main.gd, build it, fix errors if needed.`);
     await agent.waitForIdle();
 
@@ -191,7 +211,7 @@ async function runBuild(sessionId, concept, projectName, day, send) {
 
     // 5. Copy to preview dir
     if (succeeded && pckBase64) {
-      send({ type: "status", message: "Setting up preview..." });
+      broadcast({ type: "status", message: "Setting up preview..." });
       const previewDir = join(PREVIEWS_DIR, sessionId);
       mkdirSync(previewDir, { recursive: true });
 
@@ -213,13 +233,14 @@ async function runBuild(sessionId, concept, projectName, day, send) {
     session.pckBase64 = pckBase64;
     session.status = succeeded ? "done" : "failed";
 
-    send({ type: "done", success: succeeded, preview_url: session.previewUrl, pck_size: pckBase64 ? Buffer.from(pckBase64, "base64").length : 0, steps: stepCount, session_id: sessionId });
+    broadcast({ type: "done", success: succeeded, preview_url: session.previewUrl, pck_size: pckBase64 ? Buffer.from(pckBase64, "base64").length : 0, steps: stepCount, session_id: sessionId });
   } catch (err) {
     console.error(`[generate] Error: ${err.message}`);
     session.status = "error";
     session.log.push(`ERROR: ${err.message}`);
-    send({ type: "error", error: err.message });
+    broadcast({ type: "error", error: err.message });
   } finally {
+    activeSessionId = null;
     ops.destroyContainer();
   }
 }
@@ -295,43 +316,59 @@ iframe{width:100%;height:500px;border:1px solid #333;border-radius:8px;backgroun
 const log=document.getElementById('log'),result=document.getElementById('result'),frame=document.getElementById('frame'),btn=document.getElementById('btn');
 function addLog(s){log.textContent+=s+'\\n';log.scrollTop=log.scrollHeight;}
 
-function startBuild(wsMsg){
-  btn.disabled=true;log.style.display='block';log.textContent='';result.style.display='none';frame.style.display='none';
+let activeWs=null;
+
+function handleMsg(d){
+  if(d.type==='status')addLog('>> '+d.message);
+  else if(d.type==='thinking')addLog('\\n💭 '+d.message);
+  else if(d.type==='thinking_delta'){log.textContent+=d.content;log.scrollTop=log.scrollHeight;}
+  else if(d.type==='text_delta'){log.textContent+=d.content;log.scrollTop=log.scrollHeight;}
+  else if(d.type==='tool')addLog('\\n🔧 step '+d.step+': '+d.command.slice(0,120));
+  else if(d.type==='tool_result')addLog('  → '+d.output.slice(0,200));
+  else if(d.type==='session')addLog('>> Building: '+d.model);
+  else if(d.type==='active_build'){
+    btn.disabled=true;btn.textContent='Building...';
+    log.style.display='block';log.textContent='>> Rejoined active build: '+d.concept+'\\n';
+    if(d.log)d.log.forEach(l=>addLog(l));
+  }
+  else if(d.type==='done'){
+    addLog(d.success?'\\n✅ BUILD SUCCESS':'\\n❌ BUILD FAILED');
+    if(d.success&&d.preview_url){
+      result.innerHTML='<b>Game ready!</b> <a href="'+d.preview_url+'" target="_blank">Open in new tab</a>';
+      result.style.display='block';frame.src=d.preview_url;frame.style.display='block';
+    }
+    btn.disabled=false;btn.textContent='Build';loadSessions();
+  }else if(d.type==='error'){addLog('ERROR: '+d.error);btn.disabled=false;btn.textContent='Build';loadSessions();}
+}
+
+function connectWs(onOpen){
   const proto=location.protocol==='https:'?'wss:':'ws:';
   const ws=new WebSocket(proto+'//'+location.host+'/ws');
-  ws.onopen=()=>{addLog('Connected...');ws.send(JSON.stringify(wsMsg));};
-  ws.onmessage=(e)=>{
-    try{
-      const d=JSON.parse(e.data);
-      if(d.type==='status')addLog('>> '+d.message);
-      else if(d.type==='thinking')addLog('\\n💭 '+d.message);
-      else if(d.type==='thinking_delta'){log.textContent+=d.content;log.scrollTop=log.scrollHeight;}
-      else if(d.type==='text_delta'){log.textContent+=d.content;log.scrollTop=log.scrollHeight;}
-      else if(d.type==='tool')addLog('\\n🔧 step '+d.step+': '+d.command.slice(0,120));
-      else if(d.type==='tool_result')addLog('  → '+d.output.slice(0,200));
-      else if(d.type==='done'){
-        addLog(d.success?'\\n✅ BUILD SUCCESS':'\\n❌ BUILD FAILED');
-        if(d.success&&d.preview_url){
-          result.innerHTML='<b>Game ready!</b> <a href="'+d.preview_url+'" target="_blank">Open in new tab</a>';
-          result.style.display='block';frame.src=d.preview_url;frame.style.display='block';
-        }
-        btn.disabled=false;ws.close();loadSessions();
-      }else if(d.type==='error'){addLog('ERROR: '+d.error);btn.disabled=false;ws.close();loadSessions();}
-    }catch{}
-  };
-  ws.onerror=()=>{addLog('WebSocket error');btn.disabled=false;loadSessions();};
-  ws.onclose=()=>{if(btn.disabled){addLog('Connection closed');btn.disabled=false;loadSessions();}};
+  ws.onopen=()=>{activeWs=ws;if(onOpen)onOpen(ws);};
+  ws.onmessage=(e)=>{try{handleMsg(JSON.parse(e.data));}catch{}};
+  ws.onerror=()=>{addLog('WebSocket error');btn.disabled=false;btn.textContent='Build';};
+  ws.onclose=()=>{activeWs=null;if(btn.disabled){addLog('Connection closed');btn.disabled=false;btn.textContent='Build';loadSessions();}};
+  return ws;
 }
 
 function go(){
   const concept=document.getElementById('concept').value.trim();
   if(!concept)return;
-  startBuild({type:'generate',concept,project_name:concept.slice(0,30)});
+  btn.disabled=true;btn.textContent='Building...';
+  log.style.display='block';log.textContent='';result.style.display='none';frame.style.display='none';
+  connectWs(ws=>ws.send(JSON.stringify({type:'generate',concept,project_name:concept.slice(0,30)})));
 }
 
 function retry(sessionId){
-  startBuild({type:'retry',session_id:sessionId});
+  btn.disabled=true;btn.textContent='Building...';
+  log.style.display='block';log.textContent='';result.style.display='none';frame.style.display='none';
+  connectWs(ws=>ws.send(JSON.stringify({type:'retry',session_id:sessionId})));
 }
+
+// On page load, check for active build
+fetch('/active').then(r=>r.json()).then(d=>{
+  if(d.active){connectWs();}
+}).catch(()=>{});
 
 async function loadSessions(){
   try{const r=await fetch('/sessions');const list=await r.json();const el=document.getElementById('sessions');
@@ -377,20 +414,34 @@ wss.on("connection", (ws) => {
   console.log("[ws] Client connected");
   const send = (data) => { try { if (ws.readyState === 1) ws.send(JSON.stringify(data)); } catch {} };
 
+  // If a build is active, subscribe this client to its updates
+  if (activeSessionId) {
+    const s = sessions.get(activeSessionId);
+    send({ type: "active_build", session_id: activeSessionId, concept: s?.concept, title: s?.title, steps: s?.steps, log: s?.log?.slice(-30) });
+    activeListeners.add(send);
+  }
+
   ws.on("message", async (raw) => {
     try {
       const msg = JSON.parse(raw.toString());
-      if (msg.type === "generate") {
+      if (msg.type === "generate" || msg.type === "retry") {
+        if (activeSessionId) {
+          send({ type: "error", error: "A build is already in progress. Wait for it to finish." });
+          return;
+        }
+        const concept = msg.type === "retry" ? sessions.get(msg.session_id)?.concept : msg.concept;
+        const title = msg.type === "retry" ? sessions.get(msg.session_id)?.title : msg.project_name;
+        if (!concept) { send({ type: "error", error: "No concept" }); return; }
+        activeListeners.add(send);
         const sessionId = randomUUID().slice(0, 8);
-        await runBuild(sessionId, msg.concept, msg.project_name, msg.day, send);
-      } else if (msg.type === "retry") {
-        // Retry a previous session's concept
-        const prev = sessions.get(msg.session_id);
-        if (prev) {
-          const sessionId = randomUUID().slice(0, 8);
-          await runBuild(sessionId, prev.concept, prev.title, prev.day, send);
-        } else {
-          send({ type: "error", error: "Session not found" });
+        await runBuild(sessionId, concept, title, msg.day, send);
+        activeListeners.delete(send);
+      } else if (msg.type === "watch") {
+        // Subscribe to active build updates
+        activeListeners.add(send);
+        if (activeSessionId) {
+          const s = sessions.get(activeSessionId);
+          send({ type: "active_build", session_id: activeSessionId, concept: s?.concept, steps: s?.steps });
         }
       }
     } catch (err) {
@@ -398,7 +449,10 @@ wss.on("connection", (ws) => {
     }
   });
 
-  ws.on("close", () => console.log("[ws] Client disconnected"));
+  ws.on("close", () => {
+    activeListeners.delete(send);
+    console.log("[ws] Client disconnected");
+  });
 });
 
 server.listen(PORT, () => {
