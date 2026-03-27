@@ -109,6 +109,12 @@ export class SimpleAgent {
 
           this.emit("tool_result", { output: output.slice(0, 2000), isError });
 
+          // Check if build succeeded — stop early
+          if (output.includes("BUILD_SUCCESS")) {
+            messages.push({ role: "tool", tool_call_id: tc.id, content: output.slice(0, 8000) });
+            return { success: true, steps: step, messages, buildSuccess: true };
+          }
+
           // Feed result back — model sees errors and can fix them
           messages.push({
             role: "tool",

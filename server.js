@@ -13,7 +13,7 @@ import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 import { randomUUID } from "crypto";
 import { gzipSync } from "zlib";
-import { buildSystemPrompt } from "./prompt-builder.js";
+import { buildSystemPromptV2 as buildSystemPrompt } from "./prompt-v2.js";
 
 import { DockerBashOperations } from "./docker-bash-ops.js";
 import { LocalBashOperations } from "./local-bash-ops.js";
