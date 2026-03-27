@@ -209,6 +209,9 @@ async function runBuild(sessionId, concept, projectName, day, send, modelKey) {
     agent.on("error", (d) => {
       broadcast({ type: "error", error: d.error });
     });
+    agent.on("status", (d) => {
+      broadcast({ type: "status", message: d.message });
+    });
 
     // 3. Run
     broadcast({ type: "status", message: "Agent thinking..." });
